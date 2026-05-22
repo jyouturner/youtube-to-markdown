@@ -6658,7 +6658,98 @@ def cmd_serve(args) -> int:
             "Stored in <code>~/yt2md/channels.txt</code>."
             "</p>"
         )
+
+        # Per-channel Claude Project setup. Surfaces one link per channel
+        # that already has at least one digest on disk (a Project on a
+        # never-digested channel would have nothing to chat about).
+        known = _known_channel_names(digests_dir)
+        if known:
+            from urllib.parse import quote
+            body += (
+                '<h2 style="margin-top:40px">Set up a Claude Project for this channel</h2>'
+                '<p class="meta-info">'
+                'Group a channel\'s digests into a <strong>Claude Project</strong> '
+                'on claude.ai so follow-up questions chat against just that channel\'s '
+                'library. Each link below renders the Custom Instructions you paste '
+                'into a Project to scope it. Requires the '
+                '<a href="https://github.com/jyouturner/youtube-to-markdown#talk-to-your-library-from-claude-mcp" target="_blank" rel="noopener">'
+                'yt2md MCP server</a> connected in your Claude client.'
+                '</p>'
+                '<ul class="channel-list">'
+            )
+            for name in known:
+                body += (
+                    '<li>'
+                    f'<span class="url">{name}</span>'
+                    f'<a href="/channels/project-instructions?channel={quote(name)}">Setup →</a>'
+                    '</li>'
+                )
+            body += '</ul>'
+
         return page(body, title="Subscriptions", current="channels")
+
+    @app.route("/channels/project-instructions")
+    def channels_project_instructions():
+        """Render the per-channel Claude Project Custom Instructions in a
+        copy-friendly textarea, with a 4-step setup walkthrough. The
+        copyable text is exactly what `yt2md project-instructions
+        --channel <name>` would print — single source of truth."""
+        from flask import request, redirect
+        from markupsafe import escape
+
+        wanted = (request.args.get("channel") or "").strip()
+        known = _known_channel_names(digests_dir)
+        # Case-insensitive exact resolution so URL-encoded names round-trip
+        # cleanly through casing differences.
+        canonical = next(
+            (n for n in known if n.lower() == wanted.lower()),
+            None,
+        )
+        if not canonical:
+            return redirect(
+                "/channels?msg=No+digests+yet+for+that+channel"
+            )
+
+        instructions = render_claude_project_instructions(canonical)
+        safe_name = escape(canonical)
+        safe_instructions = escape(instructions)
+        body = (
+            f'<h1>Claude Project: {safe_name}</h1>'
+            '<p>Paste the instructions below into a new Claude Project\'s '
+            '<em>Custom Instructions</em> box. The Project will then scope '
+            f'every chat to <strong>{safe_name}</strong>\'s digests via the '
+            'yt2md MCP tools.</p>'
+            '<ol class="setup-steps">'
+            '<li>Open <a href="https://claude.ai/projects" target="_blank" rel="noopener">'
+            'claude.ai/projects</a> and create a new Project. Name it after '
+            f'the channel (e.g. <code>{safe_name}</code>).</li>'
+            '<li>In the Project, open <strong>Custom Instructions</strong> '
+            'and paste the text from the box below.</li>'
+            '<li>Make sure the <a href="https://github.com/jyouturner/youtube-to-markdown#talk-to-your-library-from-claude-mcp" '
+            'target="_blank" rel="noopener">yt2md MCP server</a> is connected '
+            'in your Claude client. Without it the Project has no way to read '
+            'your local library.</li>'
+            '<li>Open a chat in the Project and ask away — try '
+            f'<em>"what\'s the latest on {safe_name}?"</em> to confirm the '
+            'agent is calling <code>list_digests</code> with the right channel filter.</li>'
+            '</ol>'
+            '<div style="margin-top:24px">'
+            '<button type="button" data-copy-target="proj-instructions">'
+            'Copy instructions</button>'
+            '</div>'
+            '<textarea id="proj-instructions" readonly '
+            'style="width:100%; min-height:360px; margin-top:12px; '
+            'font-family: ui-monospace, monospace; font-size: 13px; '
+            'padding:12px; border:1px solid #ddd; border-radius:6px;">'
+            f'{safe_instructions}'
+            '</textarea>'
+            '<p class="meta-info" style="margin-top:16px">'
+            'Same text is available on the CLI: '
+            f'<code>yt2md project-instructions --channel "{safe_name}"</code>.'
+            '</p>'
+        )
+        return page(body, title=f"Claude Project — {canonical}",
+                    current="channels")
 
     @app.route("/channels", methods=["POST"])
     def channels_add():
@@ -9208,6 +9299,110 @@ def cmd_retrofit_topics(args) -> int:
     return 0 if not result["errors"] else 1
 
 
+# ---- Claude Project per-channel instructions ---------------------------
+#
+# A Claude Project on claude.ai can be pinned to a single channel by giving
+# it Custom Instructions that tell the agent to scope every yt2md MCP call
+# to that channel's name. This pair (render_claude_project_instructions +
+# cmd_project_instructions) emits that text. Surfaced in the web UI on the
+# Subscriptions page as a "Set up Claude Project" link, and on the CLI as
+# `yt2md project-instructions [--channel <name>]`.
+
+
+def _known_channel_names(digests_dir: Optional[Path] = None) -> List[str]:
+    """Distinct channel_names that have at least one digest on disk.
+
+    Read from per-digest metadata.json, sorted case-insensitively. Used
+    by both the CLI lister (no --channel arg) and the web Subscriptions
+    page to decide which channels can offer a Claude Project setup link.
+    """
+    if digests_dir is None:
+        digests_dir = get_data_dir() / "digests"
+    if not digests_dir.exists():
+        return []
+    seen: dict = {}
+    for d in digests_dir.iterdir():
+        if not d.is_dir():
+            continue
+        meta_path = d / "metadata.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text())
+        except Exception:
+            continue
+        name = (meta.get("channel_name") or "").strip()
+        if name and name.lower() not in seen:
+            seen[name.lower()] = name
+    return sorted(seen.values(), key=lambda s: s.lower())
+
+
+def render_claude_project_instructions(channel_name: str) -> str:
+    """Return Markdown text to paste into a Claude Project's Custom
+    Instructions. Pins the agent to `channel_name` via the yt2md MCP tools.
+
+    The text is deliberately the *contents* of the Custom Instructions
+    box — no surrounding setup prose (that lives on the page that hosts
+    this text).
+    """
+    return f"""You are a reading assistant scoped to a single YouTube channel: **{channel_name}**.
+
+Your knowledge of this channel comes from the yt2md MCP server running on the user's machine. It reads a local library of per-video artifacts (digest, panel discussion, takeaway synthesis, slides) that yt2md has already generated. Always pass `channel="{channel_name}"` to scope your queries — never query the global library.
+
+How to work:
+
+1. **Searching.** Default to `search_library(q="…")` first; hits include the `digest_id` you can pass to `read_digest`. The search is library-wide, so check that each hit's `channel` matches "{channel_name}" before quoting it. If search returns nothing, try `list_digests(channel="{channel_name}", q="<title keyword>")` and pick by title.
+2. **No question yet.** When the user opens a fresh chat without a specific ask, call `list_digests(channel="{channel_name}", unread=True, limit=5)`. Offer to walk through the most recent unread digest. If nothing is unread, fall back to `list_digests(channel="{channel_name}", limit=5)`.
+3. **Reading efficiently.** For a deep question, read the relevant `takeaway` first (it's the synthesis), then `panel` (critique), then specific `topics`. Don't read `section="full"` unless you actually need everything — it burns tokens.
+4. **Citing.** Every factual claim should reference the digest's title and, where possible, the YouTube timestamp link from the digest body. `read_digest` returns a `video` block with the canonical `url`.
+
+What you do NOT have:
+- The raw video. You cannot watch, transcribe, or re-extract frames — the digest text is the source of truth. If something isn't in the digest/panel/takeaway, say so rather than guess.
+- Other channels. If the user asks about a video that's not on **{channel_name}**, tell them — they should open a different Project (one per channel) for that.
+- Live ingestion expectations. You *can* call `digest_video(url)` if the user pastes a new URL, but the pipeline takes 5–10 minutes; let them know it'll land in the library after, and offer to come back to it.
+"""
+
+
+def cmd_project_instructions(args) -> int:
+    """`yt2md project-instructions [--channel <name>]`.
+
+    With no --channel: list channel_names that have at least one digest
+    on disk (the ones a Project would actually have something to chat
+    about). With --channel: case-insensitive substring match against
+    those known names; render the template if exactly one matches.
+    """
+    known = _known_channel_names()
+    if not args.channel:
+        if not known:
+            print("No digested channels yet. Subscribe and let the scheduler "
+                  "poll, or run `yt2md digest <url>` first.")
+            return 0
+        print("Channels in your library (pass one to --channel):")
+        for name in known:
+            print(f"  {name}")
+        return 0
+
+    needle = args.channel.strip().lower()
+    matches = [n for n in known if needle in n.lower()]
+    if not matches:
+        print(f"No channel in the library matches {args.channel!r}.",
+              file=sys.stderr)
+        if known:
+            print("Known channels:", file=sys.stderr)
+            for n in known:
+                print(f"  {n}", file=sys.stderr)
+        return 1
+    if len(matches) > 1:
+        print(f"{args.channel!r} matches multiple channels — be more specific:",
+              file=sys.stderr)
+        for n in matches:
+            print(f"  {n}", file=sys.stderr)
+        return 1
+
+    print(render_claude_project_instructions(matches[0]))
+    return 0
+
+
 # ---- MCP server subcommand ---------------------------------------------
 #
 # Exposes the Phase A agent API (read_digest, search_library, etc.) over
@@ -9580,6 +9775,17 @@ def _subcommand_main(argv: List[str]) -> int:
     topics_p.add_argument("--json", action="store_true", help="Emit JSON")
     topics_p.set_defaults(func=cmd_topics)
 
+    proj_p = sub.add_parser(
+        "project-instructions",
+        help="Render Custom Instructions for a per-channel Claude Project "
+             "scoped to one channel's library via the yt2md MCP tools",
+    )
+    proj_p.add_argument("--channel", default="",
+                        help="Channel name (case-insensitive substring, "
+                             "must match exactly one channel that has at "
+                             "least one digest). Omit to list known channels.")
+    proj_p.set_defaults(func=cmd_project_instructions)
+
     retro_p = sub.add_parser(
         "retrofit-topics",
         help="Tag any digest in the library that doesn't have LLM topics yet "
@@ -9605,6 +9811,7 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] in (
         "watch", "serve", "doctor", "mcp",
         "list", "read", "search", "digest", "topics", "retrofit-topics",
+        "project-instructions",
     ):
         load_env_files()
         sys.exit(_subcommand_main(sys.argv[1:]))

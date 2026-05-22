@@ -6,9 +6,10 @@
 # 1. Check ffmpeg/ffprobe (can't safely auto-install system tools)
 # 2. Install uv if missing (with confirmation prompt)
 # 3. uv sync (installs Python deps; no-op if already in sync)
-# 4. yt2md doctor (verifies the rest — Node 20+ for yt-dlp, ANTHROPIC_API_KEY,
-#    YouTube cookies, etc.). If anything blocks, print its output and bail.
-# 5. yt2md serve (launches the local web reader on http://localhost:7682)
+# 4. Prompt for ANTHROPIC_API_KEY if not set (saves to ~/yt2md/.env).
+# 5. yt2md doctor (verifies the rest — Node 20+ for yt-dlp, YouTube cookies,
+#    etc.). If anything blocks, print its output and bail.
+# 6. yt2md serve (launches the local web reader on http://localhost:7682)
 #
 # Usage:  ./run.sh
 
@@ -62,7 +63,15 @@ green "✓ uv ($(uv --version | awk '{print $2}'))"
 bold "==> Syncing Python deps (uv sync — fast no-op if already in sync)"
 uv sync
 
-# ---- 4. Doctor (Node, API key, cookies, settings sanity) ----
+# ---- 4. Ensure API key (prompt + save on first run) ----
+bold "==> Checking API key"
+uv run python -c "
+from youtube_to_markdown import load_env_files, ensure_api_key
+load_env_files()
+ensure_api_key()
+"
+
+# ---- 5. Doctor (Node, cookies, settings sanity) ----
 bold "==> Running doctor"
 if ! uv run yt2md doctor; then
     red "Doctor flagged blocking issues. Fix the items above, then re-run ./run.sh."
@@ -75,6 +84,6 @@ if ! uv run yt2md doctor; then
     exit 1
 fi
 
-# ---- 5. Launch the web reader ----
+# ---- 6. Launch the web reader ----
 bold "==> Launching reader on http://localhost:7682/"
 exec uv run yt2md serve
