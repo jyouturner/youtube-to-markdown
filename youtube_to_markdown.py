@@ -2151,6 +2151,46 @@ class ClaudeCodeBackend:
         return schema.model_validate(data), usage
 
 
+def _resolve_claude_binary_for_pty() -> Tuple[Optional[str], Optional[str]]:
+    """Find a `claude` on PATH whose --help advertises the flags the PTY
+    backend needs (--tools, --system-prompt, --disable-slash-commands). Older
+    npm-installed 1.x lacks --tools entirely; modern 2.x has it. Returns
+    (binary_path, None) on success, or (None, error_message) on failure."""
+    seen: list = []
+    for entry in (os.environ.get("PATH") or "").split(os.pathsep):
+        if not entry:
+            continue
+        candidate = os.path.join(entry, "claude")
+        if not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
+            continue
+        real = os.path.realpath(candidate)
+        if real in seen:
+            continue
+        seen.append(real)
+        try:
+            help_out = subprocess.run(
+                [candidate, "--help"],
+                capture_output=True, text=True, timeout=15,
+            ).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if "--tools" in help_out and "--system-prompt" in help_out:
+            return candidate, None
+    if not seen:
+        return None, (
+            "claude binary not found on PATH. Install Claude Code "
+            "(https://docs.claude.com/en/docs/claude-code/quickstart) "
+            "and sign in to your Pro/Max plan."
+        )
+    return None, (
+        f"None of the {len(seen)} `claude` install(s) on PATH support the "
+        "flags the PTY backend needs (--tools, --system-prompt). Candidates: "
+        + ", ".join(seen)
+        + ". Upgrade via `claude install` so the modern 2.x version is found "
+        "first on PATH."
+    )
+
+
 class ClaudeCodePtyBackend:
     """Drives the sandboxed `claude` binary as an interactive REPL via a PTY,
     instead of `claude -p`. Why: starting June 15 2026 Anthropic bills `-p` and
@@ -2191,13 +2231,13 @@ class ClaudeCodePtyBackend:
         # Pro/Max), not the sandboxed one. The sandbox runs -p with an API
         # key fallback; the PTY backend's whole point is to hit the user's
         # subscription, which is OAuth-authenticated in their primary config.
-        binary = shutil.which("claude")
+        # Probe candidates because users can have multiple `claude` installs
+        # on PATH (e.g. an old npm-installed 1.x via nvm AND a current 2.x
+        # via `claude install`) — pick the first one whose --help mentions
+        # the flags we depend on.
+        binary, why = _resolve_claude_binary_for_pty()
         if not binary:
-            raise RuntimeError(
-                "claude binary not found on PATH. Install Claude Code "
-                "(https://docs.claude.com/en/docs/claude-code/quickstart) "
-                "and sign in to your Pro/Max plan."
-            )
+            raise RuntimeError(why)
         try:
             import pyte  # noqa: F401
         except ImportError as e:
