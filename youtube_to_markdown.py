@@ -2244,12 +2244,24 @@ class ClaudeCodePtyBackend:
                 f"claude PTY returned non-JSON for a schema-constrained call. "
                 f"Output: {text[:500]}"
             )
+        raw = m.group(0)
         try:
-            return schema.model_validate(json.loads(m.group(0))), usage
-        except json.JSONDecodeError as e:
-            raise RuntimeError(
-                f"claude PTY returned invalid JSON: {e}\nOutput: {text[:500]}"
-            )
+            return schema.model_validate(json.loads(raw)), usage
+        except json.JSONDecodeError:
+            # pyte hard-wraps long lines into separate screen rows, which
+            # surfaces as raw newlines inside JSON string values — invalid by
+            # spec. Fall back to collapsing all whitespace runs to a single
+            # space; JSON parsers treat whitespace as insignificant outside
+            # strings, and yt2md schemas use short string values where
+            # collapsing inside-string whitespace is acceptable.
+            collapsed = re.sub(r"\s+", " ", raw)
+            try:
+                return schema.model_validate(json.loads(collapsed)), usage
+            except json.JSONDecodeError as e:
+                raise RuntimeError(
+                    f"claude PTY returned invalid JSON even after wrap-aware "
+                    f"collapse: {e}\nOutput: {raw[:800]}"
+                )
 
     def vision_parse(self, *, system: str, content_blocks: list,
                      model: str, max_tokens: int, schema):
@@ -2268,11 +2280,15 @@ class ClaudeCodePtyBackend:
         import time
         import pyte
 
+        # Use --tools="" (equals form) instead of --tools "" — commander.js's
+        # variadic <tools...> parser intermittently rejects the empty positional
+        # form with `error: unknown option '--tools'`, which then fails our boot
+        # detection. The equals form binds the empty value directly.
         cmd = [
             self._binary,
             "--model", model,
             "--system-prompt", system,
-            "--tools", "",
+            "--tools=",
             "--disable-slash-commands",
         ]
 
