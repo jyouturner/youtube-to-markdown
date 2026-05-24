@@ -10532,8 +10532,15 @@ def main():
                               f"input: {v_usage.input_tokens} tokens  |  "
                               f"output: {v_usage.output_tokens} tokens  |  "
                               f"cost: ${v_log_entry['cost_usd']:.4f}")
-                    except VisionUnsupported as e:
-                        print(f"      vision unsupported: {e}; falling back to timestamp picks.")
+                    except Exception as e:
+                        # Anything from the vision call — VisionUnsupported,
+                        # auth errors, rate limits, network blips — should
+                        # NOT kill the pipeline. Digest is the load-bearing
+                        # artifact; timestamp-based frame picks are a fine
+                        # fallback and slides.pptx / panel / takeaway still
+                        # generate cleanly.
+                        print(f"      vision skipped ({type(e).__name__}: {e}); "
+                              "falling back to timestamp picks.")
 
             write_markdown_digest(
                 digest, frames, duration, digest_path, images_dir, vision_picks,
