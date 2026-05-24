@@ -2428,11 +2428,14 @@ class ClaudeCodePtyBackend:
             os.write(master, b"\r")
 
             # Wait for the response to settle. End-of-response signal is the
-            # `✻ <verb> for Ns` footer Claude Code emits AFTER a response
-            # finishes (the verb rotates: "Brewed", "Cogitated", "Cooking",
-            # "Pondered", "Mused", etc. — match on the shape, not the word).
-            # We also bail on a rate/usage limit line.
-            done_re = re.compile(r"✻\s+\w+\s+for\s+\d+s")
+            # `✻ <verb> for <duration>` footer Claude Code emits AFTER a
+            # response finishes (verb rotates: "Brewed", "Cogitated",
+            # "Cooking", "Baked", "Pondered" — match on shape, not the word).
+            # Duration switches format past 60s: "9s" / "1m 0s" / "1h 5m 30s"
+            # — match one-or-more "<digits><unit-letter>" chunks separated by
+            # whitespace. Earlier verb-only match missed everything > 60s,
+            # which is every digest/panel/takeaway call on a real video.
+            done_re = re.compile(r"✻\s+\w+\s+for\s+\d+\w(?:\s+\d+\w)*")
             deadline = time.time() + timeout
             seen_marker = False
             while time.time() < deadline:
