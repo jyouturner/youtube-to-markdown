@@ -2151,15 +2151,318 @@ class ClaudeCodeBackend:
         return schema.model_validate(data), usage
 
 
+class ClaudeCodePtyBackend:
+    """Drives the sandboxed `claude` binary as an interactive REPL via a PTY,
+    instead of `claude -p`. Why: starting June 15 2026 Anthropic bills `-p` and
+    Agent SDK usage from a separate metered "Agent SDK credit" pool, while
+    *interactive* session usage continues to count against the user's Pro/Max
+    plan. Driving the REPL programmatically keeps the bill on the subscription.
+
+    Mechanics: spawn `claude` (no `-p`) under a PTY, wait for the input box to
+    settle, send the prompt via bracketed-paste so the REPL treats long inputs
+    as one atomic paste, then \\r to submit. Read stdout through a pyte virtual
+    terminal so the TUI's cursor-positioning ANSI is rendered to a clean
+    scrollable screen. Extract the response between the `⏺ ` marker and the
+    `✻ Brewed`/next-input-prompt footer.
+
+    Caveats:
+    - No token-usage envelope in interactive mode; usage counts come back zero.
+      That's accurate for cost-audit purposes — subscription billing has no
+      per-call dollar amount.
+    - Vision is not supported (interactive mode has no clean image-input path).
+    - The TUI is a moving target; pin the claude binary version and re-verify
+      the screen markers on upgrade. End-of-response detection is via "✻ Brewed"
+      / "✻ Cooking" / input-box redraw — Anthropic could change these.
+    - One PTY = one inflight request. Caller must serialize.
+    """
+    name = "claude-code-pty"
+    vision_supported = False
+
+    # Screen geometry. Wide because pyte preserves line wraps as real
+    # newlines — for parse() that breaks JSON strings whose values exceed the
+    # terminal width. Tall + history covers long-form responses (panel ≈ 2k
+    # words). We read both display + history when extracting.
+    _COLS = 1200
+    _ROWS = 500
+    _HISTORY = 20000
+
+    def __init__(self, *, vision_enabled: bool = False):
+        # Resolve the user's PRIMARY claude install (logged into claude.ai
+        # Pro/Max), not the sandboxed one. The sandbox runs -p with an API
+        # key fallback; the PTY backend's whole point is to hit the user's
+        # subscription, which is OAuth-authenticated in their primary config.
+        binary = shutil.which("claude")
+        if not binary:
+            raise RuntimeError(
+                "claude binary not found on PATH. Install Claude Code "
+                "(https://docs.claude.com/en/docs/claude-code/quickstart) "
+                "and sign in to your Pro/Max plan."
+            )
+        try:
+            import pyte  # noqa: F401
+        except ImportError as e:
+            raise RuntimeError(
+                "pyte is required for the claude-code-pty backend. Run `uv sync`."
+            ) from e
+        self._binary = binary
+        # Inherit the user's environment so OAuth credentials and default
+        # CLAUDE_CONFIG_DIR (~/.claude) are visible. Explicitly strip
+        # ANTHROPIC_API_KEY so the REPL can't silently fall back to API
+        # billing if OAuth login is missing.
+        env = os.environ.copy()
+        env.pop("ANTHROPIC_API_KEY", None)
+        self._env = env
+        # CWD: a yt2md-controlled directory under the data dir so the REPL's
+        # workspace-trust state is isolated from the user's real projects.
+        workdir = get_data_dir() / "claude-pty-workdir"
+        workdir.mkdir(parents=True, exist_ok=True)
+        self._cwd = str(workdir)
+
+    def text(self, *, system: str, user_text: str, model: str,
+             max_tokens: int, cache: bool = False):
+        # max_tokens, cache: ignored — no equivalents in interactive mode.
+        text, usage = self._run(system=system, user_text=user_text, model=model)
+        return text, usage
+
+    def parse(self, *, system: str, user_text: str, model: str,
+              max_tokens: int, schema, cache: bool = False):
+        # No --json-schema flag in interactive mode; instruct via system prompt
+        # and validate on the way out.
+        schema_json = json.dumps(schema.model_json_schema())
+        sys_with_schema = (
+            system
+            + "\n\nReply with ONLY a single JSON object matching this schema. "
+            "Output raw JSON only — no markdown fences, no prose before or after.\n"
+            + schema_json
+        )
+        text, usage = self._run(
+            system=sys_with_schema, user_text=user_text, model=model,
+        )
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            raise RuntimeError(
+                f"claude PTY returned non-JSON for a schema-constrained call. "
+                f"Output: {text[:500]}"
+            )
+        try:
+            return schema.model_validate(json.loads(m.group(0))), usage
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"claude PTY returned invalid JSON: {e}\nOutput: {text[:500]}"
+            )
+
+    def vision_parse(self, *, system: str, content_blocks: list,
+                     model: str, max_tokens: int, schema):
+        raise VisionUnsupported(
+            "claude-code-pty backend does not support vision input. Use the api "
+            "backend, or switch to claude-code with claude_code_vision enabled."
+        )
+
+    def _run(self, *, system: str, user_text: str, model: str,
+             timeout: float = 600.0):
+        import pty
+        import select
+        import fcntl
+        import termios
+        import struct
+        import time
+        import pyte
+
+        cmd = [
+            self._binary,
+            "--model", model,
+            "--system-prompt", system,
+            "--tools", "",
+            "--disable-slash-commands",
+        ]
+
+        screen = pyte.HistoryScreen(self._COLS, self._ROWS, history=self._HISTORY)
+        stream = pyte.ByteStream(screen)
+
+        master, slave = pty.openpty()
+        fcntl.ioctl(
+            master, termios.TIOCSWINSZ,
+            struct.pack("HHHH", self._ROWS, self._COLS, 0, 0),
+        )
+        env = {
+            **self._env,
+            "TERM": "xterm-256color",
+            "COLUMNS": str(self._COLS),
+            "LINES": str(self._ROWS),
+        }
+        proc = subprocess.Popen(
+            cmd, stdin=slave, stdout=slave, stderr=slave,
+            close_fds=True, cwd=self._cwd, env=env,
+        )
+        os.close(slave)
+
+        def drain():
+            while True:
+                r, _, _ = select.select([master], [], [], 0.1)
+                if not r:
+                    return
+                try:
+                    chunk = os.read(master, 8192)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                stream.feed(chunk)
+
+        def screen_text() -> str:
+            buf: list = []
+            top = getattr(screen.history, "top", None)
+            if top is not None:
+                for line in top:
+                    buf.append("".join(c.data for c in line).rstrip())
+            for line in screen.display:
+                buf.append(line.rstrip())
+            return "\n".join(buf).rstrip()
+
+        try:
+            # Boot phase: wait for the input prompt to settle. The sandboxed
+            # claude may show first-run onboarding modals (theme picker,
+            # workspace trust, welcome splash) if it's never been driven
+            # interactively before — dismiss each by pressing Enter (the
+            # default-selected option is always the safe choice). Loop until
+            # we see the input-box footer.
+            boot_deadline = time.time() + 45.0
+            last_dismiss_at = 0.0
+            booted = False
+            while time.time() < boot_deadline:
+                drain()
+                t = screen_text()
+                if "for shortcuts" in t or "for agents" in t:
+                    booted = True
+                    break
+                # Modal heuristic: a numbered-options dialog with a "❯" pointer
+                # awaiting selection. The default highlighted option is what
+                # we'd choose interactively (trust=Yes, theme=Dark mode, etc.).
+                # Rate-limit our Enter presses so we don't double-submit.
+                looks_like_modal = (
+                    "❯" in t
+                    and re.search(r"\b1\.\s", t) is not None
+                    and ("confirm" in t.lower() or "select" in t.lower()
+                         or "choose" in t.lower() or "trust" in t.lower()
+                         or "let's get started" in t.lower())
+                )
+                if looks_like_modal and time.time() - last_dismiss_at > 1.5:
+                    os.write(master, b"\r")
+                    last_dismiss_at = time.time()
+                    time.sleep(0.8)
+                    continue
+                time.sleep(0.25)
+            if not booted:
+                raise RuntimeError(
+                    f"claude PTY did not reach an interactive prompt within 45s. "
+                    f"Last screen tail:\n{screen_text()[-800:]}"
+                )
+            time.sleep(0.4)
+            drain()
+
+            # Send the prompt via bracketed paste, then \r to submit. Without
+            # bracketed-paste markers, long inputs get chunked by kernel writes
+            # and the REPL treats each chunk as a separate paste.
+            BPS, BPE = b"\x1b[200~", b"\x1b[201~"
+            payload = BPS + user_text.encode("utf-8") + BPE
+            for i in range(0, len(payload), 1024):
+                os.write(master, payload[i:i + 1024])
+                time.sleep(0.005)
+            time.sleep(0.3)
+            os.write(master, b"\r")
+
+            # Wait for the response to settle. End-of-response signal is the
+            # `✻ <verb> for Ns` footer Claude Code emits AFTER a response
+            # finishes (the verb rotates: "Brewed", "Cogitated", "Cooking",
+            # "Pondered", "Mused", etc. — match on the shape, not the word).
+            # We also bail on a rate/usage limit line.
+            done_re = re.compile(r"✻\s+\w+\s+for\s+\d+s")
+            deadline = time.time() + timeout
+            seen_marker = False
+            while time.time() < deadline:
+                drain()
+                t = screen_text()
+                if "⏺" in t:
+                    seen_marker = True
+                lower = t.lower()
+                if "rate limit" in lower or "usage limit" in lower:
+                    raise RuntimeError(
+                        f"Claude Code reported a usage/rate limit. Tail:\n"
+                        f"{t[-500:]}"
+                    )
+                if seen_marker and done_re.search(t):
+                    time.sleep(0.5)
+                    drain()
+                    break
+                time.sleep(0.25)
+
+            response = self._extract_response(screen_text())
+            if not response:
+                raise RuntimeError(
+                    f"claude PTY produced no response within {timeout:.0f}s. "
+                    f"Final screen tail:\n{screen_text()[-600:]}"
+                )
+            return response, _zero_usage()
+        finally:
+            # Ctrl-C twice is Claude Code's escape to exit.
+            try:
+                os.write(master, b"\x03")
+                time.sleep(0.2)
+                os.write(master, b"\x03")
+                time.sleep(0.2)
+            except OSError:
+                pass
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            try:
+                os.close(master)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _extract_response(text: str) -> str:
+        """Pull the assistant's text out of the rendered TUI. Response lives
+        between the LAST `⏺ ` marker and the subsequent `✻` footer / next `❯`
+        input box / horizontal rule.
+        """
+        lines = text.splitlines()
+        start: Optional[int] = None
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].lstrip().startswith("⏺"):
+                start = i
+                break
+        if start is None:
+            return ""
+        out: list = []
+        for line in lines[start:]:
+            stripped = line.lstrip()
+            if stripped.startswith("✻") or stripped.startswith("❯"):
+                break
+            if stripped.startswith("─") and out:
+                break
+            if stripped.startswith("⏺"):
+                line = stripped[1:].lstrip()
+            out.append(line)
+        return "\n".join(l for l in out if l.strip()).strip()
+
+
 def select_backend(*, vision_enabled: Optional[bool] = None):
     """Resolve the active LLM backend from settings + environment.
 
-    Honors settings["llm_backend"] in {"auto", "api", "claude-code"}:
-      - "auto":        prefer "api" when ANTHROPIC_API_KEY is set, else
-                       "claude-code" when sandboxed claude is installed and
-                       logged in, else raises RuntimeError.
-      - "api":         requires ANTHROPIC_API_KEY.
-      - "claude-code": requires sandbox install + login.
+    Honors settings["llm_backend"] in {"auto", "api", "claude-code", "claude-code-pty"}:
+      - "auto":            prefer "api" when ANTHROPIC_API_KEY is set, else
+                           "claude-code" when sandboxed claude is installed and
+                           logged in, else raises RuntimeError.
+      - "api":             requires ANTHROPIC_API_KEY.
+      - "claude-code":     requires sandbox install + login. Uses `claude -p`;
+                           after Jun 15 2026 this bills against the Agent SDK
+                           credit pool, not the Pro/Max subscription.
+      - "claude-code-pty": requires sandbox install + login. Drives the REPL
+                           via a PTY so usage stays on the Pro/Max subscription.
+                           No native vision, no token usage counts.
     """
     s = load_settings()
     choice = (s.get("llm_backend") or "auto").lower()
@@ -2181,6 +2484,12 @@ def select_backend(*, vision_enabled: Optional[bool] = None):
                 "Run /setup to install it."
             )
         return ClaudeCodeBackend(vision_enabled=vision_enabled)
+
+    if choice == "claude-code-pty":
+        # Doesn't use the yt2md sandbox — uses the user's primary `claude` so
+        # OAuth (Pro/Max) auth applies. ClaudeCodePtyBackend.__init__ raises
+        # a descriptive error if `claude` is not on PATH.
+        return ClaudeCodePtyBackend(vision_enabled=vision_enabled)
 
     # auto: prefer API when key is set (keeps prompt caching + native vision);
     # else fall through to Claude Code only when both installed AND we have a
@@ -7007,7 +7316,8 @@ def cmd_serve(args) -> int:
         backend_choices = (
             ("auto", "auto — pick API when ANTHROPIC_API_KEY is set, else Claude Code"),
             ("api", "api — direct Anthropic API (requires ANTHROPIC_API_KEY)"),
-            ("claude-code", "claude-code — bundled Claude Code subprocess (requires Claude.ai login)"),
+            ("claude-code", "claude-code — bundled Claude Code via `claude -p` (will bill against the Agent SDK credit pool after Jun 15 2026)"),
+            ("claude-code-pty", "claude-code-pty — primary local `claude` driven as interactive REPL (stays on Pro/Max plan, no vision, ~10–15s/call overhead)"),
         )
         body += '<label>LLM backend'
         body += '  <select name="llm_backend">'
@@ -7018,7 +7328,12 @@ def cmd_serve(args) -> int:
         body += (
             '  <span class="suffix" style="display:block;">'
             'Which auth path to use for digest / panel calls. The "auto" mode '
-            'picks the cheapest available path. Switch from <a href="/setup">/setup</a>.'
+            'picks the cheapest available path. Switch from <a href="/setup">/setup</a>. '
+            '<strong>claude-code-pty</strong> uses your machine\'s primary '
+            '<code>claude</code> install (must be signed in to Pro/Max) and drives '
+            'it as an interactive REPL — this is the only path that stays on '
+            'subscription billing after Jun 15 2026, when Anthropic moves '
+            '<code>claude -p</code> to a separate metered Agent SDK credit pool.'
             '</span>'
             '</label>'
         )

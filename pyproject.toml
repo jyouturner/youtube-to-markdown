@@ -17,6 +17,7 @@ dependencies = [
     "onnxruntime<1.20; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "mcp>=1.2",
     "qrcode>=7.0",
+    "pyte>=0.8.2",
 ]
 
 [project.scripts]

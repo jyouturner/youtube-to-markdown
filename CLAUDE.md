@@ -37,11 +37,12 @@ There is no lint or unit-test suite. The PostToolUse hook in `.claude/settings.j
 
 Every artifact is regeneratable from the cached `downloads/` directory — the per-video page has `Generate X` buttons that retry a single stage.
 
-**LLM backend abstraction.** Two implementations:
+**LLM backend abstraction.** Three implementations:
 - `AnthropicAPIBackend` — uses the Anthropic SDK + `ANTHROPIC_API_KEY`. Supports native vision and prompt caching.
-- `ClaudeCodeBackend` — shells out to a sandboxed local Claude Code install (no per-call billing; uses the user's Claude.ai plan). Vision is opt-in via the `claude_code_vision` setting.
+- `ClaudeCodeBackend` — shells out via `claude -p` to a sandboxed local Claude Code install. Vision is opt-in via the `claude_code_vision` setting. **Billing changes Jun 15 2026**: Anthropic moves `claude -p` (and Agent SDK) usage from Pro/Max interactive limits to a separate metered "Agent SDK credit" pool — i.e. starts billing at API rates. Until then, calls draw from the user's Pro/Max plan if the sandbox is OAuth-logged-in; falls back to `ANTHROPIC_API_KEY` if not.
+- `ClaudeCodePtyBackend` — drives the user's *primary* `claude` install (resolved via `shutil.which("claude")`) as an interactive REPL under a PTY, using `pyte` to render the TUI to a virtual screen and `\x1b[200~...\x1b[201~` bracketed-paste for long prompts. Stays on Pro/Max subscription billing post-Jun-2026 because the `-p` flag is the billing trigger. No token usage envelope (interactive mode emits none), no native vision, ~10–15s per call (REPL startup). End-of-response detection is the `✻ <verb> for Ns` footer Claude Code prints after each response — the verb rotates ("Brewed", "Cogitated", etc.), match on shape. Strips `ANTHROPIC_API_KEY` from the subprocess env so the REPL can't silently fall back to API billing.
 
-`select_backend()` resolves which one to use from `settings["llm_backend"]` ∈ `{auto, api, claude-code}`. Auto prefers API when the key is set, else falls back to Claude Code only when both installed *and* the cached login sentinel is present (so the caller redirects to `/setup` rather than burning a doomed call). New LLM calls should accept an optional `backend=` and default to `select_backend()`.
+`select_backend()` resolves which one to use from `settings["llm_backend"]` ∈ `{auto, api, claude-code, claude-code-pty}`. Auto prefers API when the key is set, else falls back to Claude Code only when both installed *and* the cached login sentinel is present (so the caller redirects to `/setup` rather than burning a doomed call). `claude-code-pty` is never auto-selected — opt-in only via settings. New LLM calls should accept an optional `backend=` and default to `select_backend()`.
 
 **Data layout (everything under `~/yt2md/`, override with `YT2MD_DATA`):**
 - `.env` — `ANTHROPIC_API_KEY` (mode 0600).
@@ -58,6 +59,7 @@ Every artifact is regeneratable from the cached `downloads/` directory — the p
 - **Don't break syntax.** The PostToolUse hook will block your next action if `youtube_to_markdown.py` is unparseable after an edit. Fix it before doing anything else.
 - **Two surfaces, one library.** The web (`cmd_serve`), the CLI (`list/read/search/digest`), and the MCP server (`cmd_mcp`) all call the *same* underlying library functions. When you add a capability, wire it through the shared function — don't duplicate logic per surface.
 - **Backend-agnostic LLM calls.** Accept an optional `backend` parameter, default to `select_backend()`. Don't hardcode `anthropic.Anthropic(...)`.
+- **PTY backend is TUI-coupled.** `ClaudeCodePtyBackend` parses Claude Code's REPL output via `pyte` and looks for specific markers (`⏺` for response start, `✻ <verb> for Ns` for completion). Each Claude Code upgrade is a potential break — re-run a smoke call after bumping `claude`. Pin a known-good version in any deployment.
 - **Frame extraction is one ffmpeg call by design.** The single-decode `extract_scene_and_interval_frames` is a performance fix; reverting to two subprocesses ~doubles pipeline time on slide-heavy talks.
 - **The panel is the cost.** Opus calls dominate (~70%+ of per-video spend). Be conservative about adding more.
 - **Windows is unverified.** Code paths are platform-aware but no one has run end-to-end. macOS is the supported path; Linux mostly works.
