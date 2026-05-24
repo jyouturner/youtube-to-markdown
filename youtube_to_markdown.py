@@ -2465,7 +2465,8 @@ class ClaudeCodePtyBackend:
         return "\n".join(l for l in out if l.strip()).strip()
 
 
-def select_backend(*, vision_enabled: Optional[bool] = None):
+def select_backend(*, vision_enabled: Optional[bool] = None,
+                   for_vision: bool = False):
     """Resolve the active LLM backend from settings + environment.
 
     Honors settings["llm_backend"] in {"auto", "api", "claude-code", "claude-code-pty"}:
@@ -2476,14 +2477,31 @@ def select_backend(*, vision_enabled: Optional[bool] = None):
       - "claude-code":     requires sandbox install + login. Uses `claude -p`;
                            after Jun 15 2026 this bills against the Agent SDK
                            credit pool, not the Pro/Max subscription.
-      - "claude-code-pty": requires sandbox install + login. Drives the REPL
-                           via a PTY so usage stays on the Pro/Max subscription.
-                           No native vision, no token usage counts.
+      - "claude-code-pty": requires `claude` on PATH + OAuth Pro/Max login.
+                           Drives the REPL via a PTY so text/parse calls stay
+                           on subscription billing. No native vision; vision
+                           callers should pass for_vision=True to opportunistically
+                           route those calls to the API backend (preserves frame
+                           quality while keeping text/panel/etc. on subscription).
+
+    for_vision=True: caller is about to make a vision_parse() call. If the
+    primary backend can't do vision and ANTHROPIC_API_KEY is set, transparently
+    return AnthropicAPIBackend() instead — implements the hybrid PTY-for-text +
+    API-for-vision routing without exposing a new user-facing setting. If no
+    API key is available, returns the primary backend anyway and lets the
+    caller's VisionUnsupported fallback handle it.
     """
     s = load_settings()
     choice = (s.get("llm_backend") or "auto").lower()
     if vision_enabled is None:
         vision_enabled = bool(s.get("claude_code_vision", False))
+
+    # Hybrid short-circuit: PTY mode has no vision path; route image calls
+    # through the API when a key is available. The text/parse split keeps the
+    # vast majority of token volume on the subscription while preserving the
+    # frame-picking quality that timestamp-based fallback can't match.
+    if for_vision and choice == "claude-code-pty" and os.environ.get("ANTHROPIC_API_KEY"):
+        return AnthropicAPIBackend()
 
     if choice == "api":
         if not os.environ.get("ANTHROPIC_API_KEY"):
@@ -5275,7 +5293,7 @@ def build_slides_for_video(
         if (settings.get("slide_classification", True)
                 and len(deck_frames) > _GRID_CELLS):
             try:
-                backend = select_backend()
+                backend = select_backend(for_vision=True)
                 if getattr(backend, "vision_supported", False):
                     deck_frames = classify_slides_via_grids(
                         deck_frames, backend=backend,
@@ -7333,7 +7351,7 @@ def cmd_serve(args) -> int:
             ("auto", "auto — pick API when ANTHROPIC_API_KEY is set, else Claude Code"),
             ("api", "api — direct Anthropic API (requires ANTHROPIC_API_KEY)"),
             ("claude-code", "claude-code — bundled Claude Code via `claude -p` (will bill against the Agent SDK credit pool after Jun 15 2026)"),
-            ("claude-code-pty", "claude-code-pty — primary local `claude` driven as interactive REPL (stays on Pro/Max plan, no vision, ~10–15s/call overhead)"),
+            ("claude-code-pty", "claude-code-pty — primary local `claude` driven as interactive REPL (stays on Pro/Max plan; if ANTHROPIC_API_KEY is also set, vision calls auto-route to API so frame quality is preserved)"),
         )
         body += '<label>LLM backend'
         body += '  <select name="llm_backend">'
@@ -7349,7 +7367,11 @@ def cmd_serve(args) -> int:
             '<code>claude</code> install (must be signed in to Pro/Max) and drives '
             'it as an interactive REPL — this is the only path that stays on '
             'subscription billing after Jun 15 2026, when Anthropic moves '
-            '<code>claude -p</code> to a separate metered Agent SDK credit pool.'
+            '<code>claude -p</code> to a separate metered Agent SDK credit pool. '
+            'When PTY is selected and an <code>ANTHROPIC_API_KEY</code> is also '
+            'present, image-based calls (slide classifier and per-topic '
+            'frame-picking) auto-route through the API so frame quality is '
+            'preserved — the text-heavy 80% of the bill still goes to your plan.'
             '</span>'
             '</label>'
         )
@@ -10384,7 +10406,7 @@ def main():
             )
             if slide_classify_enabled and len(deck_frames) > _GRID_CELLS:
                 try:
-                    classifier_backend = select_backend()
+                    classifier_backend = select_backend(for_vision=True)
                     if getattr(classifier_backend, "vision_supported", False):
                         _classify_t0 = _time.monotonic()
                         deck_frames = classify_slides_via_grids(
@@ -10444,21 +10466,26 @@ def main():
 
             vision_picks = None
             if not args.no_vision:
-                if not getattr(backend, "vision_supported", False):
-                    print(f"[+] Vision skipped — {backend.name} backend has vision disabled "
+                # Vision routing: even if the text/parse backend is PTY (no
+                # vision), select_backend(for_vision=True) will return the API
+                # backend if a key is available — hybrid mode without a separate
+                # user setting. Falls back to timestamp-based picks otherwise.
+                vision_backend = select_backend(for_vision=True)
+                if not getattr(vision_backend, "vision_supported", False):
+                    print(f"[+] Vision skipped — {vision_backend.name} backend has vision disabled "
                           "(timestamp-based picks will be used).")
                 else:
-                    print(f"[+] Vision-picking frames with {args.digest_model}...")
+                    print(f"[+] Vision-picking frames with {args.digest_model} via {vision_backend.name}...")
                     _vision_t0 = _time.monotonic()
                     try:
                         vision_picks, v_usage = vision_pick_frames(
                             digest, frames, duration, args.digest_model,
-                            segments=segments, backend=backend,
+                            segments=segments, backend=vision_backend,
                         )
                         v_log_entry = record_llm_usage(
                             video_id=log_video_id, kind="vision_pick",
                             model=args.digest_model,
-                            backend_name=backend.name, usage=v_usage,
+                            backend_name=vision_backend.name, usage=v_usage,
                         )
                         timings["vision"] = round(_time.monotonic() - _vision_t0, 3)
                         print(f"      vision-selected {len(vision_picks)}/{len(digest.topics)} topics  |  "

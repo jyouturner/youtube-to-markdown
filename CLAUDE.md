@@ -44,6 +44,8 @@ Every artifact is regeneratable from the cached `downloads/` directory — the p
 
 `select_backend()` resolves which one to use from `settings["llm_backend"]` ∈ `{auto, api, claude-code, claude-code-pty}`. Auto prefers API when the key is set, else falls back to Claude Code only when both installed *and* the cached login sentinel is present (so the caller redirects to `/setup` rather than burning a doomed call). `claude-code-pty` is never auto-selected — opt-in only via settings. New LLM calls should accept an optional `backend=` and default to `select_backend()`.
 
+**Hybrid vision routing (built into PTY mode).** PTY can't do vision, so `select_backend(for_vision=True)` transparently returns `AnthropicAPIBackend()` when the primary choice is `claude-code-pty` AND `ANTHROPIC_API_KEY` is set. No new user setting — the routing is implicit. Vision callsites (`classify_slides_via_grids`, `vision_pick_frames` in `main()` and `build_slides_for_video`) all pass `for_vision=True` so PTY users automatically get API-backed frame picking when a key is available, falling back to timestamp-based picks otherwise. Cost impact: image stages (~$0.18/video) keep using API while text/panel/digest/takeaway (~$0.76/video) move to the Pro/Max subscription.
+
 **Data layout (everything under `~/yt2md/`, override with `YT2MD_DATA`):**
 - `.env` — `ANTHROPIC_API_KEY` (mode 0600).
 - `settings.json` — model choices, language, cookies-from-browser, `llm_backend`.
