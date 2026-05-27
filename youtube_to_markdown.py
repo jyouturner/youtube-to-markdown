@@ -9977,6 +9977,49 @@ When done, surface:
 - A one-line summary of where the panel pushed back on the speaker.
 - That artifacts are at `~/yt2md/digests/<video_id>/` and visible in the web reader at `http://localhost:7682/d/<video_id>` (assuming `yt2md serve` is running).
 """,
+    "yt2md-poll-subscriptions": """---
+name: yt2md-poll-subscriptions
+description: Use to poll all watched YouTube channels for newly-posted videos and digest each new one. Designed to be invoked by a Cowork Desktop Scheduled Task on a recurring schedule (e.g. every 6 hours), but works fine ad-hoc too. Triggers on phrases like "check my subscriptions", "poll watched channels", "run yt2md subscriptions". Uses yt2md's local MCP toolkit; replaces yt2md's in-process scheduler with a Cowork-driven flow so all reasoning bills against the user's Pro/Max subscription.
+allowed-tools: yt2md.list_subscriptions yt2md.list_new_channel_videos yt2md.mark_channel_video_seen yt2md.start_video_prep yt2md.job_status_prep yt2md.get_video_meta yt2md.get_transcript yt2md.get_playbook yt2md.get_slide_classifier_grids yt2md.get_topic_candidate_frames yt2md.write_digest yt2md.build_video_deck yt2md.write_panel yt2md.write_takeaway
+---
+
+# Poll yt2md subscriptions and digest new videos
+
+Goal: for every watched YouTube channel, find videos posted since the last poll and produce a full digest (digest + panel + takeaway + slides) for each. Run autonomously — no human in the loop. yt2md tracks the per-channel "last seen" cursor; you orchestrate.
+
+## Workflow
+
+**1. Enumerate channels.** Call `yt2md.list_subscriptions()`. If empty, report "no channels subscribed; nothing to poll" and stop.
+
+**2. For each channel, find new videos.** Call `yt2md.list_new_channel_videos(channel_url, limit=10)`. It returns:
+- `[]` on a channel's first poll (yt2md seeds the cursor; no backfill — match the existing semantic).
+- `[]` when nothing's new since last poll.
+- Otherwise, up to `limit` recent video IDs not yet digested.
+
+**3. For each new video, run the digest workflow.** Follow the same flow the `yt2md-digest-video` skill describes (call `start_video_prep`, poll `job_status_prep`, fetch playbooks, generate digest/panel/takeaway, build deck). For autonomous runs, you can skip the "report back to the user" step at the end — the artifacts on disk are the deliverable.
+
+**4. Mark each video seen.** After each successfully-written digest, call `yt2md.mark_channel_video_seen(channel_url, video_id)` so the next poll doesn't re-surface it. Skip this on failures — yt2md will retry next poll.
+
+## Parallelism
+
+If you have sub-agent capacity, fan out one sub-agent per new video — they're independent (different transcripts, different artifacts). Within a single video, panel and takeaway can also parallelize (independent of each other; both depend on the digest existing first).
+
+Limit concurrent prep jobs to ~3 to avoid saturating the user's bandwidth and Anthropic plan rate limits. The Pro plan caps at ~44K tokens / 5h, Max5 at ~88K, Max20 at ~220K — one video uses ~100K-ish so plan accordingly.
+
+## Constraints
+
+- Cowork tool calls timeout at 4 minutes hard. Always use the `start_video_prep` + poll pattern; never wait synchronously.
+- This skill should be SAFE TO RE-RUN. If a previous poll digested a video but crashed before marking it seen, the next poll's `list_new_channel_videos` will filter it out (it checks both the seen cursor AND on-disk digest dirs).
+- If digesting a video fails with a permanent error (private/members-only/removed), call `yt2md.mark_channel_video_seen` anyway — otherwise polling churns on it forever. Skip transient errors (network blips, rate limits); they retry naturally.
+
+## Reporting
+
+Produce a one-line summary per channel: `<channel_name>: N new digested, M new failed, K skipped`. End with a total. Keep it terse — this is an autonomous run, not a chat.
+
+## Failure recovery
+
+If a sub-agent crashes mid-digest, the partial artifacts on disk are valid (yt2md writes atomically). Next poll re-surfaces the same video; `start_video_prep` returns `status: "exists"` and you continue from where the previous run left off. No special handling needed.
+""",
 }
 
 
@@ -9998,13 +10041,21 @@ def cmd_install_skills(args) -> int:
         target_dir.mkdir(parents=True, exist_ok=True)
         target_path = target_dir / "SKILL.md"
         target_path.write_text(body)
-        written.append(target_path)
+        written.append((name, target_path))
         print(f"  wrote {target_path}")
     print()
-    print(f"Installed {len(written)} skill(s) to {skills_root}/")
-    print("Restart Claude Desktop (or claude CLI) to pick them up. "
-          "Trigger by asking Claude to digest a YouTube URL, or "
-          "invoke explicitly with /yt2md-digest-video.")
+    print(f"Installed {len(written)} skill(s) to {skills_root}/. "
+          "Restart Claude Desktop (or claude CLI) to pick them up.")
+    print()
+    print("Skills installed:")
+    for name, _ in written:
+        print(f"  /{name}")
+    print()
+    print("Usage:")
+    print("  yt2md-digest-video       — auto-triggers on a pasted YouTube URL")
+    print("                             with a digest/summarize intent")
+    print("  yt2md-poll-subscriptions — wire to a Cowork Desktop Scheduled")
+    print("                             Task to auto-digest new channel videos")
     return 0
 
 
@@ -10282,6 +10333,74 @@ def cmd_mcp(args) -> int:
     def remove_subscription(channel_url: str) -> dict:
         """Unsubscribe from a YouTube channel. Idempotent."""
         return globals()["remove_subscription"](channel_url)
+
+    @mcp.tool()
+    def list_new_channel_videos(channel_url: str, limit: int = 10) -> list:
+        """List recently-posted videos on a watched channel that yt2md
+        hasn't yet digested. Designed to be called by a scheduled-task
+        polling skill: drive each returned URL through start_video_prep
+        + the digest workflow.
+
+        On a channel's FIRST poll, returns [] AND seeds the "seen" set
+        with the latest `limit` videos — i.e. no backfill, start
+        watching forward. Subsequent polls return videos posted since
+        last poll, up to `limit`. Videos that already have a digest dir
+        on disk are also filtered out (so a one-off digest of a
+        channel video doesn't get re-digested by the scheduler).
+
+        Args:
+            channel_url: full YouTube channel URL (must already be in
+                the subscription list — call list_subscriptions first
+                or add_subscription).
+            limit: max videos to return per call. Default 10.
+
+        Returns: list of {video_id, url, channel_url}. Empty list on
+            first poll (seed only) or when no new videos."""
+        from pathlib import Path as _P
+        state = load_state()
+        seen = set(state["channels"].get(channel_url, {}).get("seen", []))
+        latest_ids = _list_channel_videos(channel_url)
+        if not seen:
+            # First poll: seed and return nothing — match watch_run's
+            # no-backfill semantic. User can still manually digest old
+            # videos via the one-off flow.
+            state["channels"][channel_url] = {"seen": sorted(latest_ids)}
+            save_state(state)
+            return []
+        digests_dir = get_data_dir() / "digests"
+        new_ids: list = []
+        for vid in latest_ids:
+            if vid in seen:
+                continue
+            if (digests_dir / vid / "digest.md").exists():
+                continue
+            new_ids.append(vid)
+            if len(new_ids) >= limit:
+                break
+        return [
+            {"video_id": vid,
+             "url": f"https://youtu.be/{vid}",
+             "channel_url": channel_url}
+            for vid in new_ids
+        ]
+
+    @mcp.tool()
+    def mark_channel_video_seen(channel_url: str, video_id: str) -> dict:
+        """Persistently mark a video as seen for a channel's poll
+        cursor. Call this AFTER successfully digesting a video the
+        scheduler surfaced via list_new_channel_videos, so the next
+        poll doesn't re-surface it. Idempotent."""
+        state = load_state()
+        slot = state["channels"].setdefault(channel_url, {"seen": []})
+        seen = set(slot.get("seen", []))
+        before = len(seen)
+        seen.add(video_id)
+        slot["seen"] = sorted(seen)
+        save_state(state)
+        return {
+            "channel_url": channel_url, "video_id": video_id,
+            "added": len(seen) > before,
+        }
 
     # ---- Cowork-as-runtime: compute-only Phase-1 tools ---------------
     #
