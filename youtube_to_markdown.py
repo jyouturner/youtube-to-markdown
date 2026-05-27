@@ -5984,6 +5984,126 @@ def local_job_status(key: str) -> dict:
     return {"phase": "done", "elapsed": elapsed}
 
 
+# ---- Cowork-as-runtime: compute-only Phase-1 helpers ------------------
+#
+# yt2md becomes a compute-only MCP toolkit for Cowork (Claude Desktop's
+# agent mode): yt2md runs ffmpeg/yt-dlp/python-pptx, and the agent in
+# Cowork does the LLM reasoning. The pipeline splits into "prep"
+# (download + frame extraction + slide-classifier grid rendering) and a
+# series of artifact-writing tools the agent calls once it has reasoned
+# over the inputs.
+#
+# State for one video lives at digests/<video_id>/prep_state.json: a
+# stable record of paths + timestamps the agent can read across tool
+# calls without re-running ffmpeg. The agent passes paths back to
+# build_video_deck / write_digest to assemble final artifacts.
+
+def _prep_state_path(video_id: str,
+                     digests_dir: Optional[Path] = None) -> Path:
+    if digests_dir is None:
+        digests_dir = get_data_dir() / "digests"
+    return digests_dir / video_id / "prep_state.json"
+
+
+def _save_prep_state(video_id: str, state: dict,
+                     digests_dir: Optional[Path] = None) -> None:
+    path = _prep_state_path(video_id, digests_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(path, state)
+
+
+def _load_prep_state(video_id: str,
+                     digests_dir: Optional[Path] = None) -> dict:
+    path = _prep_state_path(video_id, digests_dir)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"No prep state for {video_id}. Call start_video_prep "
+            "first and poll job_status_prep until phase='done'."
+        )
+    return json.loads(path.read_text())
+
+
+def _frame_ts_lookup(state: dict, frame_path: str) -> float:
+    """Resolve a frame path back to its timestamp by walking the prep
+    state's frame list. Returns 0.0 if not found (caller is passing a
+    path that isn't in the prep manifest)."""
+    for f in state.get("frames", []):
+        if f["path"] == frame_path:
+            return float(f["timestamp"])
+    return 0.0
+
+
+def _do_video_prep(url: str, *,
+                   digests_dir: Optional[Path] = None,
+                   cookies_from_browser: str = "") -> None:
+    """Compute-only worker invoked by start_local_job under
+    "{video_id}:prep". Writes:
+      - digests/<id>/downloads/<id>/<id>.mp4 + .srt (yt-dlp cache)
+      - digests/<id>/slide_classifier_grids/grid_NNN.jpg
+      - digests/<id>/prep_state.json (the manifest the MCP tools read)
+
+    No LLM calls. The agent (Cowork) drives the reasoning over what
+    this produces."""
+    import time as _t
+    if digests_dir is None:
+        digests_dir = get_data_dir() / "digests"
+
+    video_id = extract_video_id(url)
+    if not video_id:
+        raise ValueError(f"Couldn't extract a YouTube video ID from {url!r}")
+    out_dir = digests_dir / video_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    fetch = fetch_youtube(
+        url, out_dir / "downloads",
+        cookies_from_browser=cookies_from_browser or None,
+    )
+    video_path = Path(fetch["mp4"])
+    srt_path = Path(fetch["srt"])
+
+    duration = get_video_duration(video_path)
+    workdir = out_dir / "compute_workdir"
+    scene_dir = workdir / "scene"
+    interval_dir = workdir / "interval"
+    scene_frames, interval_frames = extract_scene_and_interval_frames(
+        video_path, scene_dir, interval_dir,
+        scene_threshold=0.2, interval=20.0, duration=duration,
+    )
+    frames = merge_frames(scene_frames, interval_frames)
+    frames = dedupe_frames(frames, 4)
+
+    deck_frames = global_phash_cluster(frames)
+    grid_dir = out_dir / "slide_classifier_grids"
+    grids = _render_classification_grids(deck_frames, grid_dir)
+
+    state = {
+        "video_id": video_id,
+        "mp4_path": str(video_path),
+        "srt_path": str(srt_path),
+        "source_lang": fetch.get("lang") or "en",
+        "duration": duration,
+        "frames": [
+            {"path": str(p), "timestamp": float(t)} for p, t in frames
+        ],
+        "deck_frame_candidates": [
+            {"path": str(p), "timestamp": float(t)} for p, t in deck_frames
+        ],
+        "grids": [
+            {"path": str(p), "cell_indices": list(cells)}
+            for p, cells in grids
+        ],
+        "video_title": fetch.get("title") or "",
+        "video_url": fetch.get("webpage_url") or url,
+        "channel_name": fetch.get("channel_name") or "",
+        "channel_id": fetch.get("channel_id") or "",
+        "channel_url": fetch.get("channel_url") or "",
+        "upload_date": fetch.get("upload_date") or "",
+        "thumbnail_url": fetch.get("thumbnail_url") or "",
+        "prepared_at": _t.time(),
+    }
+    _save_prep_state(video_id, state, digests_dir)
+
+
 # Job-status polling JS shared by any toolbar element with
 # data-poll-url=<url> — polls every 2s per element, updates a `.elapsed`
 # child with "{n}s", and reloads the page when the artifact appears (on
@@ -10073,6 +10193,331 @@ def cmd_mcp(args) -> int:
     def remove_subscription(channel_url: str) -> dict:
         """Unsubscribe from a YouTube channel. Idempotent."""
         return globals()["remove_subscription"](channel_url)
+
+    # ---- Cowork-as-runtime: compute-only Phase-1 tools ---------------
+    #
+    # These tools let an agent (Cowork in Claude Desktop) drive the
+    # digest pipeline by orchestrating yt2md's compute stages + doing
+    # its own LLM reasoning. yt2md itself makes no LLM calls in this
+    # flow. See _do_video_prep for the prep state schema.
+
+    @mcp.tool()
+    def start_video_prep(url: str) -> dict:
+        """Phase 1 of the Cowork digest flow. Spawns a background job
+        that does the compute-only stages: download video, extract
+        frames, dedupe, pre-render slide-classifier grids. Returns
+        immediately so the caller dodges the ~4-minute Cowork tool
+        timeout.
+
+        Poll job_status_prep(video_id) until phase='done', then use
+        get_transcript / get_slide_classifier_grids / etc. to drive
+        the LLM stages from your own session.
+
+        Returns: {video_id, status: 'started' | 'running' | 'exists'}.
+        Idempotent: re-calling while a prep is in flight is a no-op."""
+        video_id = extract_video_id(url)
+        if not video_id:
+            raise ValueError(
+                f"Couldn't extract a YouTube video ID from {url!r}"
+            )
+        digests_dir = get_data_dir() / "digests"
+        if _prep_state_path(video_id, digests_dir).exists():
+            return {"video_id": video_id, "status": "exists"}
+        cookies = (load_settings().get("cookies_from_browser") or
+                   os.environ.get("YT2MD_COOKIES_FROM_BROWSER") or "")
+        started = start_local_job(
+            f"{video_id}:prep", _do_video_prep, url,
+            digests_dir=digests_dir, cookies_from_browser=cookies,
+        )
+        return {
+            "video_id": video_id,
+            "status": "started" if started else "running",
+        }
+
+    @mcp.tool()
+    def job_status_prep(video_id: str) -> dict:
+        """Status of an in-flight start_video_prep job.
+        Returns {phase: idle|running|done|error, elapsed?, error?}."""
+        return local_job_status(f"{video_id}:prep")
+
+    @mcp.tool()
+    def get_transcript(video_id: str) -> str:
+        """Return the timestamped transcript for a prepped video.
+        Format: '[HH:MM:SS] <text>' per line. Requires
+        start_video_prep to have completed."""
+        state = _load_prep_state(video_id)
+        segments = parse_srt(Path(state["srt_path"]))
+        return "\n".join(
+            f"[{format_timestamp(s.start)}] {s.text}" for s in segments
+        )
+
+    @mcp.tool()
+    def get_video_meta(video_id: str) -> dict:
+        """Return basic metadata for a prepped video: title, source
+        language, duration (seconds), channel, upload date, video URL,
+        thumbnail URL, number of candidate frames, and number of
+        slide-classifier grids."""
+        state = _load_prep_state(video_id)
+        return {
+            "video_id": state["video_id"],
+            "video_title": state.get("video_title", ""),
+            "video_url": state.get("video_url", ""),
+            "channel_name": state.get("channel_name", ""),
+            "channel_id": state.get("channel_id", ""),
+            "channel_url": state.get("channel_url", ""),
+            "upload_date": state.get("upload_date", ""),
+            "thumbnail_url": state.get("thumbnail_url", ""),
+            "source_lang": state.get("source_lang", "en"),
+            "duration": state.get("duration", 0.0),
+            "n_frames": len(state.get("frames", [])),
+            "n_deck_candidates": len(state.get("deck_frame_candidates", [])),
+            "n_grids": len(state.get("grids", [])),
+        }
+
+    @mcp.tool()
+    def get_slide_classifier_grids(video_id: str) -> list:
+        """Return the pre-rendered 3×3 grid images so the agent can
+        decide which cells are real deck slides. Each grid is a JPEG
+        with cells numbered 1-9, top-left to bottom-right; consecutive
+        grids share a 1-cell overlap (cell 1 of grid N is the last
+        real frame of grid N-1) so the agent can judge boundary
+        continuity.
+
+        Returns: list of {grid_index, cell_indices, image} where
+        cell_indices[i] is the index into prep_state.deck_frame_
+        candidates for that grid's cell (i+1)."""
+        from mcp.server.fastmcp import Image
+        state = _load_prep_state(video_id)
+        out: list = []
+        for i, grid in enumerate(state.get("grids", [])):
+            out.append({
+                "grid_index": i,
+                "cell_indices": grid["cell_indices"],
+                "image": Image(path=grid["path"], format="jpeg"),
+            })
+        return out
+
+    @mcp.tool()
+    def get_topic_candidate_frames(
+        video_id: str,
+        topic_start_sec: float,
+        topic_end_sec: float,
+    ) -> list:
+        """For one topic window, return up to 5 evenly-spaced
+        candidate frames as inline image content blocks. The agent
+        picks the most illustrative frame per topic (e.g. for the
+        digest's per-topic embedded image).
+
+        Returns: list of {candidate_index, timestamp, image}."""
+        from mcp.server.fastmcp import Image
+        state = _load_prep_state(video_id)
+        frames = [(Path(f["path"]), float(f["timestamp"]))
+                  for f in state["frames"]]
+        cands = _candidates_for_topic(
+            float(topic_start_sec), float(topic_end_sec), frames,
+        )
+        return [
+            {"candidate_index": ci, "timestamp": ts,
+             "image": Image(path=str(p), format="jpeg")}
+            for ci, (p, ts) in enumerate(cands)
+        ]
+
+    @mcp.tool()
+    def write_digest(
+        video_id: str,
+        title: str,
+        overview: str,
+        topics: list,
+        vision_picks: Optional[dict] = None,
+    ) -> dict:
+        """Persist the agent-generated digest to digest.md.
+
+        topics: [{title: str, start_time: float, summary: str,
+            key_points: [str, ...]}]. Match the schema from
+            get_playbook('digest').
+        vision_picks: optional {topic_index_as_str: frame_path}
+            mapping. If provided, those frames are embedded in the
+            digest markdown under each topic. If omitted, falls back
+            to timestamp-based picks.
+
+        Returns: {video_id, digest_path}."""
+        from pydantic import BaseModel
+        from typing import List as TList
+
+        class _Topic(BaseModel):
+            title: str
+            start_time: float
+            summary: str
+            key_points: TList[str]
+
+        class _VideoDigest(BaseModel):
+            title: str
+            overview: str
+            topics: TList[_Topic]
+
+        state = _load_prep_state(video_id)
+        digest = _VideoDigest(
+            title=title, overview=overview, topics=topics,
+        )
+        digests_dir = get_data_dir() / "digests"
+        digest_path = digests_dir / video_id / "digest.md"
+        images_dir = digest_path.parent / "digest_images"
+        frames = [(Path(f["path"]), float(f["timestamp"]))
+                  for f in state["frames"]]
+        picks_resolved = None
+        if vision_picks:
+            picks_resolved = {int(k): Path(v)
+                              for k, v in vision_picks.items()}
+        write_markdown_digest(
+            digest, frames, state["duration"], digest_path, images_dir,
+            picks_resolved,
+            video_title=state.get("video_title", ""),
+            video_url=state.get("video_url", ""),
+        )
+        return {"video_id": video_id, "digest_path": str(digest_path)}
+
+    @mcp.tool()
+    def write_panel(video_id: str, markdown: str) -> dict:
+        """Persist the agent-generated panel discussion to panel.md.
+        Also writes panel.json (parsed structure for the read API).
+        markdown should match the format from get_playbook('panel')."""
+        digests_dir = get_data_dir() / "digests"
+        panel_path = digests_dir / video_id / "panel.md"
+        panel_json_path = digests_dir / video_id / "panel.json"
+        _atomic_write_text(panel_path, markdown)
+        _atomic_write_json(panel_json_path, panel_text_to_json(markdown))
+        return {"video_id": video_id, "panel_path": str(panel_path)}
+
+    @mcp.tool()
+    def write_takeaway(video_id: str, markdown: str) -> dict:
+        """Persist the agent-generated takeaway to takeaway.md. Also
+        writes takeaway.json. markdown should be 1-3 paragraphs per
+        get_playbook('takeaway')."""
+        digests_dir = get_data_dir() / "digests"
+        takeaway_path = digests_dir / video_id / "takeaway.md"
+        takeaway_json_path = digests_dir / video_id / "takeaway.json"
+        body = render_takeaway_markdown(
+            markdown,
+            video_url=f"https://www.youtube.com/watch?v={video_id}",
+        )
+        _atomic_write_text(takeaway_path, body)
+        _atomic_write_json(
+            takeaway_json_path, takeaway_text_to_json(body),
+        )
+        return {"video_id": video_id, "takeaway_path": str(takeaway_path)}
+
+    @mcp.tool()
+    def build_video_deck(
+        video_id: str,
+        slide_frame_paths: list,
+    ) -> dict:
+        """Build slides.pptx from the agent's classified slide frames.
+        slide_frame_paths is the subset of prep_state.deck_frame_
+        candidates that the agent labeled NEW_SLIDE (paths in the
+        order the agent wants them in the deck)."""
+        state = _load_prep_state(video_id)
+        digests_dir = get_data_dir() / "digests"
+        deck_path = digests_dir / video_id / "slides.pptx"
+        segments = parse_srt(Path(state["srt_path"]))
+        deck_frames = [
+            (Path(p), _frame_ts_lookup(state, p))
+            for p in slide_frame_paths
+        ]
+        slides_data = assign_transcript_to_frames(
+            deck_frames, segments, state["duration"],
+        )
+        build_deck(
+            slides_data, deck_path,
+            state.get("video_title") or video_id,
+        )
+        return {"video_id": video_id, "deck_path": str(deck_path)}
+
+    @mcp.tool()
+    def get_playbook(stage: str) -> dict:
+        """Return the system prompt + output-format spec the agent
+        should follow when generating an artifact for a given stage.
+        Reuses the same prompts the legacy API/PTY backends used so
+        outputs match what the rest of yt2md expects to consume.
+
+        stage: 'digest' | 'slide_classifier' | 'vision_pick'
+             | 'panel' | 'takeaway'.
+
+        Returns: {stage, system_prompt, output_format}."""
+        if stage == "digest":
+            return {
+                "stage": "digest",
+                "system_prompt": DIGEST_SYSTEM_PROMPT,
+                "output_format": (
+                    "Return a JSON object: {title, overview, topics: "
+                    "[{title, start_time (seconds, float), summary, "
+                    "key_points: [str, ...]}]}. Pass it directly to "
+                    "write_digest()."
+                ),
+            }
+        if stage == "panel":
+            return {
+                "stage": "panel",
+                "system_prompt": PANEL_SYSTEM_PROMPT,
+                "output_format": (
+                    "Full panel discussion as markdown (1500–2500 "
+                    "words). Pass the markdown string to write_panel()."
+                ),
+            }
+        if stage == "takeaway":
+            return {
+                "stage": "takeaway",
+                "system_prompt": TAKEAWAY_SYSTEM_PROMPT,
+                "output_format": (
+                    "1-3 paragraphs of plain prose. Use inline "
+                    "[HH:MM:SS](#) Markdown links to ground specific "
+                    "claims to transcript timestamps; write_takeaway "
+                    "resolves them into clickable YouTube deep links."
+                ),
+            }
+        if stage == "slide_classifier":
+            return {
+                "stage": "slide_classifier",
+                "system_prompt": (
+                    "Classify frames in a 3×3 grid (cells 1–9). For "
+                    "each cell, choose one label:\n"
+                    "- NEW_SLIDE — content distinct from cell N-1 in "
+                    "the same grid AND from any earlier NEW_SLIDE.\n"
+                    "- SAME_AS_PREVIOUS_CELL — animation/reveal of "
+                    "the previous slide counts as same.\n"
+                    "- TALKING_HEAD — speaker dominates, no slide.\n"
+                    "- TRANSITION — fade/blur/cut, not a clean slide.\n"
+                    "Note: cell 1 of grids after the first is an "
+                    "overlap from the previous grid; judge it against "
+                    "the last NEW_SLIDE you've already labeled."
+                ),
+                "output_format": (
+                    "Call build_video_deck(video_id, "
+                    "slide_frame_paths) with the prep_state.deck_"
+                    "frame_candidates paths of cells you labeled "
+                    "NEW_SLIDE, in appearance order."
+                ),
+            }
+        if stage == "vision_pick":
+            return {
+                "stage": "vision_pick",
+                "system_prompt": (
+                    "Pick the candidate frame that best illustrates "
+                    "what the narrator is saying at that moment. "
+                    "Prefer informative visuals (diagrams, code, "
+                    "distinctive UI) over generic framing or talking-"
+                    "head shots. For animation/progressive-reveal "
+                    "sequences, prefer the LATEST candidate (most "
+                    "complete state)."
+                ),
+                "output_format": (
+                    "Build a {str(topic_index): frame_path} dict and "
+                    "pass it as write_digest(..., vision_picks=...)."
+                ),
+            }
+        raise ValueError(
+            f"unknown stage {stage!r}. Available stages: digest, "
+            "slide_classifier, vision_pick, panel, takeaway."
+        )
 
     mcp.run(transport="stdio")
     return 0

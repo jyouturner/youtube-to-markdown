@@ -7,6 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Bootstrap + launch** (preferred during development): `./run.sh` — checks ffmpeg, installs uv if missing, runs `uv sync`, prompts for `ANTHROPIC_API_KEY` if not in `~/yt2md/.env`, runs `yt2md doctor`, then `yt2md serve`. Idempotent; safe to re-run.
 - **Direct CLI** (after `uv sync`): `uv run yt2md <subcommand>` — e.g. `serve`, `digest <url>`, `list`, `read <id>`, `search <q>`, `watch {add,list,remove,run}`, `mcp`, `doctor`, `topics`, `retrofit-topics`.
 - **Default web port**: 7682. `--host 0.0.0.0` exposes the library on the LAN (used by the `/listen` QR-code phone flow); default `127.0.0.1` is localhost-only.
+- **Wire into Claude Desktop / Cowork**: add to `~/Library/Application Support/Claude/claude_desktop_config.json`: `{"mcpServers": {"yt2md": {"command": "yt2md", "args": ["mcp"]}}}`, then restart Desktop. The Cowork-only flow goes: `start_video_prep(url)` → poll `job_status_prep(video_id)` → use `get_playbook("digest")` to learn the schema → read `get_transcript(video_id)`, reason → `write_digest(video_id, ...)`. Then `get_slide_classifier_grids` → reason → `build_video_deck`. Then `write_panel` / `write_takeaway`. yt2md does zero LLM in this flow.
 - **Slide regression check** (the only "test" — single curated fixture): regenerate the deck for the fixture video via the web reader, then `uv run python tests/compare_slides.py tests/fixtures/igO8iyca2_g.pptx ~/yt2md/digests/igO8iyca2_g/slides.pptx`. Run after touching `extract_*_frames`, `dedupe_frames`, `global_phash_cluster`, `_render_classification_grids`, `classify_slides_via_grids`, `assign_transcript_to_frames`, or `build_deck`. LLM noise — re-run once before treating a failure as a regression.
 
 There is no lint or unit-test suite. The PostToolUse hook in `.claude/settings.json` `ast.parse`s any edited `.py` and blocks (exit 2) on a SyntaxError — so an Edit/Write that leaves `youtube_to_markdown.py` unparseable will fail immediately.
@@ -45,6 +46,20 @@ Every artifact is regeneratable from the cached `downloads/` directory — the p
 `select_backend()` resolves which one to use from `settings["llm_backend"]` ∈ `{auto, api, claude-code, claude-code-pty}`. Auto prefers API when the key is set, else falls back to Claude Code only when both installed *and* the cached login sentinel is present (so the caller redirects to `/setup` rather than burning a doomed call). `claude-code-pty` is never auto-selected — opt-in only via settings. New LLM calls should accept an optional `backend=` and default to `select_backend()`.
 
 **Hybrid vision routing (built into PTY mode).** PTY can't do vision, so `select_backend(for_vision=True)` transparently returns `AnthropicAPIBackend()` when the primary choice is `claude-code-pty` AND `ANTHROPIC_API_KEY` is set. No new user setting — the routing is implicit. Vision callsites (`classify_slides_via_grids`, `vision_pick_frames` in `main()` and `build_slides_for_video`) all pass `for_vision=True` so PTY users automatically get API-backed frame picking when a key is available, falling back to timestamp-based picks otherwise. Cost impact: image stages (~$0.18/video) keep using API while text/panel/digest/takeaway (~$0.76/video) move to the Pro/Max subscription.
+
+**Cowork-as-runtime (Phase 1 — additive, not yet replacing the backends).** A second MCP surface lets Claude Desktop's Cowork drive the pipeline as the agent, with yt2md doing only compute. yt2md makes NO LLM calls in this flow. The split:
+- `start_video_prep(url)` spawns a background job (fetch + frames + dedupe + render slide-classifier grids), returns `{video_id, status}` immediately. Writes `digests/<id>/prep_state.json` with all paths the agent needs.
+- `job_status_prep(video_id)` for polling — Cowork's 4-minute MCP tool timeout means EVERY long-running stage must be async + poll.
+- `get_transcript`, `get_video_meta`, `get_slide_classifier_grids` (returns FastMCP `Image` blocks the model can see), `get_topic_candidate_frames(video_id, start_sec, end_sec)` — read-side tools the agent uses to gather inputs.
+- `write_digest`, `write_panel`, `write_takeaway`, `build_video_deck` — write-side tools that persist agent-generated artifacts to the same paths the web reader serves.
+- `get_playbook(stage)` returns the existing `DIGEST_SYSTEM_PROMPT` / `PANEL_SYSTEM_PROMPT` / `TAKEAWAY_SYSTEM_PROMPT` plus an output-format spec so the agent's output matches what `write_*` expects.
+
+Worker is `_do_video_prep(url, ...)` running via `start_local_job(f"{video_id}:prep", ...)`. State persistence is a single `prep_state.json` per video — paths only, no LLM output. The classic three-backend flow (API/Code/PTY) remains intact; Cowork is the third user-facing surface alongside web + CLI. End-state plan: when Cowork integration is proven, the legacy backends + `select_backend()` + `~/yt2md/.env`/cost-tracking are deleted in a follow-up phase.
+
+Constraints worth remembering (load-bearing for any change):
+- Cowork tool-call timeout: hard 4-min cap, flaky past 60s. Anything compute-heavy MUST be start-job + poll. The `:prep` job pattern is the template.
+- Cowork tool-result size: ~500 KB ceiling per result. Image blocks must be downscaled (slide-classifier grids are 1200×675 JPEG q85 ≈ 150-200 KB — safe; vision-pick candidates use `_encode_frame_for_vision`'s 1024-long-edge default).
+- Cowork is NOT headless. Subscriptions/scheduler can't run inside Cowork. Local scheduler (`_scheduler_loop` in `cmd_serve`) keeps using the API/PTY backends until we migrate to Desktop Scheduled Tasks invoking a Cowork playbook (Phase 3).
 
 **Data layout (everything under `~/yt2md/`, override with `YT2MD_DATA`):**
 - `.env` — `ANTHROPIC_API_KEY` (mode 0600).
