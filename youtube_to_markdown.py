@@ -9919,6 +9919,95 @@ def cmd_project_instructions(args) -> int:
     return 0
 
 
+# ---- Cowork skills (bundled) ------------------------------------------
+#
+# Skills are markdown files Claude Desktop / Cowork loads from
+# ~/.claude/skills/<name>/SKILL.md. Each has YAML frontmatter (name +
+# description for auto-discovery, optional allowed-tools list) followed
+# by a markdown body the agent reads as instructions. `yt2md install-
+# skills` writes these to disk; the same skills work from `claude` CLI
+# (Claude Code) since both products share the skill standard.
+#
+# Skill body style is goal-oriented (state what to accomplish + which
+# tools are available) rather than step-by-step ("call A then B"). The
+# model picks the actual tool order. The exception is the prep poll
+# pattern — Cowork's 4-minute MCP timeout means we MUST explicitly call
+# out the async-poll workflow for start_video_prep.
+
+_BUNDLED_SKILLS: dict = {
+    "yt2md-digest-video": """---
+name: yt2md-digest-video
+description: Use when the user wants to turn a YouTube URL into a readable digest, multi-expert panel discussion, takeaway synthesis, and slide deck. Triggers on phrases like "digest this YouTube video", "summarize https://youtu.be/...", "make me a digest of <URL>", or a pasted YouTube URL preceded by a request to read or summarize. The yt2md MCP server runs locally on the user's machine and provides compute tools (yt-dlp, ffmpeg, python-pptx); you (Claude) do all the LLM reasoning yourself.
+allowed-tools: yt2md.start_video_prep yt2md.job_status_prep yt2md.get_video_meta yt2md.get_transcript yt2md.get_playbook yt2md.get_slide_classifier_grids yt2md.get_topic_candidate_frames yt2md.write_digest yt2md.build_video_deck yt2md.write_panel yt2md.write_takeaway
+---
+
+# Digest a YouTube video with yt2md
+
+Goal: produce four artifacts for one video — a topic-segmented digest (`digest.md`), a multi-expert panel critique (`panel.md`), a 1–3 paragraph takeaway (`takeaway.md`), and a slide deck (`slides.pptx`). yt2md's local MCP server does compute (download, frame extraction, deck assembly); you do all the LLM work yourself.
+
+## Workflow
+
+Treat the steps as a checklist, not a rigid sequence. yt2md is idempotent (most calls have skip-if-exists semantics) — skip what's already done. Where independent, parallelize via sub-agents (panel + takeaway are the obvious candidates).
+
+**1. Pull the playbook for each stage you're about to do.** Before generating any artifact, call `yt2md.get_playbook(stage)` and follow the returned `system_prompt` as your authoritative instructions. Available stages: `"digest"`, `"slide_classifier"`, `"vision_pick"`, `"panel"`, `"takeaway"`. The `output_format` field tells you what shape to pass to the matching `write_*` or `build_*` tool.
+
+**2. Prep the video.** Call `yt2md.start_video_prep(url)`. It returns instantly with `{video_id, status}`. Then poll `yt2md.job_status_prep(video_id)` every ~5 seconds until `phase == "done"`. On a 25-minute talk this takes ~90 seconds (mostly frame extraction); a re-run with a cached download is ~30s.
+
+Why poll: yt2md's prep stage exceeds Cowork's hard 4-minute MCP-tool timeout if run synchronously. The `:prep` job runs in a background thread; status calls are sub-second.
+
+**3. Generate the digest.** Call `yt2md.get_transcript(video_id)` to read the timestamped transcript. Apply the digest playbook to identify 5–12 topic segments + a short overview. Output the JSON shape the playbook describes, then call `yt2md.write_digest(video_id, title, overview, topics)` to persist.
+
+To embed the most informative frame per topic (recommended), call `yt2md.get_topic_candidate_frames(video_id, topic_start_sec, topic_end_sec)` once per topic — it returns ≤5 image content blocks you can see directly. Apply the `vision_pick` playbook to pick the best. Pass `{topic_index_string: frame_path}` as the `vision_picks` argument to `write_digest`. Skip vision-pick if you're under usage pressure — the digest is load-bearing and falls back to timestamp-based picks cleanly.
+
+**4. Classify slides + build the deck.** Call `yt2md.get_slide_classifier_grids(video_id)` to retrieve the pre-rendered 3×3 grid images. Each grid has 9 cells numbered 1–9 with a 1-cell overlap from the previous grid (judge cell 1 of grid N against the last NEW_SLIDE you labeled). Apply the `slide_classifier` playbook. Collect the `deck_frame_candidates` paths corresponding to cells you labeled NEW_SLIDE, in appearance order. Call `yt2md.build_video_deck(video_id, slide_frame_paths)`.
+
+**5. Panel + takeaway.** Run these in parallel sub-agents — they're independent. Each: fetch its playbook, produce markdown per its instructions, call `yt2md.write_panel` (or `write_takeaway`). The panel typically runs ~3–5min of model thinking; takeaway ~1min.
+
+## Constraints
+
+- Cowork tool calls timeout at 4 minutes hard. Anything long-running on yt2md's side is exposed as start-job + poll; never wait synchronously inside one tool call.
+- Image content blocks cap around 500 KB. The grids and frame candidates are already sized for this; don't request higher resolutions.
+- Transcript timestamps are real (parsed from the source SRT). For digest `start_time`, copy from the `[HH:MM:SS]` markers — do NOT estimate.
+- If a step fails mid-flow, on-disk artifacts are valid. The user can re-run the same URL; `start_video_prep` returns `status: "exists"` when the prep is already done.
+
+## Reporting back
+
+When done, surface:
+- The 5–12 topic titles from the digest.
+- A one-line summary of where the panel pushed back on the speaker.
+- That artifacts are at `~/yt2md/digests/<video_id>/` and visible in the web reader at `http://localhost:7682/d/<video_id>` (assuming `yt2md serve` is running).
+""",
+}
+
+
+def cmd_install_skills(args) -> int:
+    """yt2md install-skills — write bundled Cowork skills to
+    ~/.claude/skills/<name>/SKILL.md so Claude Desktop's Cowork (and
+    Claude Code) can auto-discover them via description matching or
+    invoke them by /<name>.
+
+    Idempotent: overwrites existing files at the same path (so a yt2md
+    upgrade refreshes them). Restart Claude Desktop after install for
+    the new skills to be picked up.
+    """
+    skills_root = Path.home() / ".claude" / "skills"
+    skills_root.mkdir(parents=True, exist_ok=True)
+    written: list = []
+    for name, body in _BUNDLED_SKILLS.items():
+        target_dir = skills_root / name
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / "SKILL.md"
+        target_path.write_text(body)
+        written.append(target_path)
+        print(f"  wrote {target_path}")
+    print()
+    print(f"Installed {len(written)} skill(s) to {skills_root}/")
+    print("Restart Claude Desktop (or claude CLI) to pick them up. "
+          "Trigger by asking Claude to digest a YouTube URL, or "
+          "invoke explicitly with /yt2md-digest-video.")
+    return 0
+
+
 # ---- MCP server subcommand ---------------------------------------------
 #
 # Exposes the Phase A agent API (read_digest, search_library, etc.) over
@@ -10640,6 +10729,15 @@ def _subcommand_main(argv: List[str]) -> int:
                          help="Print what would be tagged without calling the LLM")
     retro_p.set_defaults(func=cmd_retrofit_topics)
 
+    skills_p = sub.add_parser(
+        "install-skills",
+        help="Write bundled Cowork skills to ~/.claude/skills/ so Claude "
+             "Desktop / Claude Code can orchestrate the yt2md MCP toolkit "
+             "without per-call hand-holding. Idempotent; restart Claude "
+             "Desktop after to pick them up.",
+    )
+    skills_p.set_defaults(func=cmd_install_skills)
+
     args = ap.parse_args(argv)
     return args.func(args)
 
@@ -10652,7 +10750,7 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] in (
         "watch", "serve", "doctor", "mcp",
         "list", "read", "search", "digest", "topics", "retrofit-topics",
-        "project-instructions",
+        "project-instructions", "install-skills",
     ):
         load_env_files()
         sys.exit(_subcommand_main(sys.argv[1:]))
