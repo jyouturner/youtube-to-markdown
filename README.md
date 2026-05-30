@@ -91,6 +91,12 @@ configure auth — pick one of:
   and yt2md sets up a sandboxed copy on your Mac. No per-call billing —
   usage counts against your plan's rate limits.
 
+> **If you picked the API key, set a spend cap first.** This app spends
+> real money per video. Before your first digest, set a monthly spend
+> limit in the [Anthropic Console](https://console.anthropic.com/settings/limits) —
+> it's the hard backstop nothing can exceed. See **Budget controls**
+> below for the optional in-app budget gate on top of it.
+
 ---
 
 ## Once it's running
@@ -244,18 +250,54 @@ models (Sonnet 4.6 + Opus 4.7):
 | --- | --- | --- |
 | Digest | Topic segmentation | ~$0.06 |
 | Vision frame-picking | Picks one frame per topic | ~$0.13 |
-| Panel discussion | Opus, multi-expert critique | ~$0.58 |
+| Panel discussion | Opus, multi-expert critique | ~$0.20 |
 | Takeaway | Synthesis prose | ~$0.06 |
 | Slide classifier | Filters frames to real slides | ~$0.01 |
-| **Total** | | **~$0.84** |
+| **Total** | | **~$0.46** |
 
 Subscription users (Claude Code path): no per-call dollars, but each
 generation step counts against your plan's rate limits. The Activity
 page tags those calls as "subscription" instead of a dollar amount.
 
-Most cost goes to the panel — Opus is expensive but produces the
-deepest critique. You can swap to Sonnet for the panel in Settings if
-you want to cut cost roughly in half.
+Most cost goes to the panel — Opus produces the deepest critique. You
+can swap the panel to Sonnet in Settings to trim that line (and ~15–20%
+off the total). The dollar figures on the Activity page come from a
+built-in price table; if you add an admin key (see **Budget controls**
+below) yt2md recalibrates those rates from your *actual* Anthropic
+billing so they never drift.
+
+### Budget controls
+
+Because this spends real money per call, set up at least the first of
+these before your first digest:
+
+1. **A Console spend cap (do this first — the hard backstop).** In the
+   [Anthropic Console](https://console.anthropic.com/settings/limits),
+   set a monthly spend limit. When you hit it, the API stops — nothing
+   yt2md does can exceed it. This alone makes the app safe to run.
+2. **The in-app budget gate (optional, for early warning).** yt2md can
+   refuse to *start* a new digest once your month-to-date spend crosses
+   a threshold — well before the Console cap. Configure in
+   `~/yt2md/settings.json`: `budget_warn_usd` (default 15) warns,
+   `budget_block_usd` (default 18) blocks new digests. A running digest
+   is never interrupted.
+3. **An admin key (optional, unlocks #2's authoritative numbers +
+   self-calibrating prices).** Create an
+   [Admin API key](https://console.anthropic.com/settings/admin-keys)
+   (requires an organization) and add it to `~/yt2md/.env` as
+   `ANTHROPIC_ADMIN_KEY=sk-ant-admin…`. With it, the budget gate reads
+   your *real* billed month-to-date spend (not just the local estimate),
+   and `yt2md refresh-pricing` recalibrates the price table from your
+   actual invoice. Without it, the gate falls back to the local usage
+   log and prices come from the built-in table.
+
+```bash
+yt2md refresh-pricing      # recalibrate prices from real billing (needs admin key)
+```
+
+Tip: for clean per-app cost tracking, point yt2md's API key at a
+dedicated Console **workspace** and set the spend cap on that workspace —
+then its spend is isolated from your other API usage.
 
 ---
 
@@ -263,8 +305,11 @@ you want to cut cost roughly in half.
 
 Everything stays on your machine, under `~/yt2md/`:
 
-- `~/yt2md/.env` — your Anthropic credentials
-- `~/yt2md/settings.json` — model preferences, language, cookies setting
+- `~/yt2md/.env` — your Anthropic credentials (`ANTHROPIC_API_KEY`, and
+  optionally `ANTHROPIC_ADMIN_KEY` for the budget gate / price calibration)
+- `~/yt2md/settings.json` — model preferences, language, cookies, budget thresholds
+- `~/yt2md/pricing_cache.json` — price table calibrated from your real
+  billing (written by `yt2md refresh-pricing`; falls back to a built-in table)
 - `~/yt2md/channels.txt` — your subscriptions
 - `~/yt2md/digests/<video-id>/` — per-video artifacts:
   - `digest.md` — the reading

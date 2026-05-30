@@ -9987,6 +9987,36 @@ def cmd_doctor(args) -> int:
              "Many videos now require login. Set in /settings or as "
              "YT2MD_COOKIES_FROM_BROWSER=firefox in ~/yt2md/.env")
 
+    # Cost controls — this app spends real money per digest. Surface the
+    # safety setup (Console spend cap + the optional in-app budget gate)
+    # so a new user configures the "right way" before the first run.
+    print("\nCost controls:")
+    print("  reminder: set a monthly spend cap in the Anthropic Console "
+          "(https://console.anthropic.com/settings/limits) — the hard backstop "
+          "nothing can exceed.")
+    admin = os.environ.get("ANTHROPIC_ADMIN_KEY", "")
+    if admin:
+        ok(f"ANTHROPIC_ADMIN_KEY set ({admin[:14]}…) — authoritative billing + price calibration")
+    else:
+        warn("ANTHROPIC_ADMIN_KEY not set (optional)",
+             "Without it the budget gate uses the local usage log and prices come "
+             "from the built-in table. Add an org admin key to ~/yt2md/.env for real "
+             "billed month-to-date spend and `yt2md refresh-pricing`.")
+    block_usd = settings.get("budget_block_usd")
+    warn_usd = settings.get("budget_warn_usd")
+    if block_usd:
+        ok(f"budget gate: warn ${float(warn_usd or 0):.0f} / block new digests "
+           f"${float(block_usd):.0f} (month-to-date)")
+    else:
+        warn("in-app budget gate off",
+             "Set budget_warn_usd / budget_block_usd in ~/yt2md/settings.json to "
+             "refuse new digests past a monthly threshold.")
+    if _pricing_cache_path().exists():
+        ok("prices: calibrated from real billing (pricing_cache.json)")
+    else:
+        print("  prices: built-in table (run `yt2md refresh-pricing` to "
+              "calibrate from real billing — needs admin key)")
+
     print("\nConfig:")
     data_dir = get_data_dir()
     print(f"  data dir: {data_dir}")
