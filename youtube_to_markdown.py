@@ -1873,20 +1873,28 @@ DEFAULT_MODEL_PRICING: dict = {
         "input": 3.0, "output": 15.0,
         "cache_read": 0.30, "cache_creation": 3.75,
     },
-    # Opus 4.7 — panel discussion (highest-quality multi-perspective)
+    # Opus 4.7 — panel discussion (highest-quality multi-perspective).
+    # Rates per platform.claude.com/docs/.../pricing (Opus 4.5+ tier):
+    # $5 in / $25 out, 5m cache-write 1.25x ($6.25), cache-read 0.1x ($0.50).
     "claude-opus-4-7": {
-        "input": 15.0, "output": 75.0,
-        "cache_read": 1.50, "cache_creation": 18.75,
+        "input": 5.0, "output": 25.0,
+        "cache_read": 0.50, "cache_creation": 6.25,
     },
-    # Haiku 4.5 — slide classifier, validation pings
+    # Opus 4.8 — same pricing tier as 4.5/4.6/4.7.
+    "claude-opus-4-8": {
+        "input": 5.0, "output": 25.0,
+        "cache_read": 0.50, "cache_creation": 6.25,
+    },
+    # Haiku 4.5 — slide classifier, validation pings. $1 in / $5 out,
+    # 5m cache-write $1.25, cache-read $0.10.
     "claude-haiku-4-5-20251001": {
-        "input": 0.80, "output": 4.0,
-        "cache_read": 0.08, "cache_creation": 1.0,
+        "input": 1.0, "output": 5.0,
+        "cache_read": 0.10, "cache_creation": 1.25,
     },
     # Older / aliases that may show up in saved settings.json:
     "claude-haiku-4-5": {
-        "input": 0.80, "output": 4.0,
-        "cache_read": 0.08, "cache_creation": 1.0,
+        "input": 1.0, "output": 5.0,
+        "cache_read": 0.10, "cache_creation": 1.25,
     },
 }
 
@@ -2668,7 +2676,7 @@ def generate_digest(
         backend = select_backend()
     return backend.parse(
         system=DIGEST_SYSTEM_PROMPT, user_text=user_text,
-        model=model, max_tokens=16000, schema=VideoDigest, cache=True,
+        model=model, max_tokens=16000, schema=VideoDigest,
     )
 
 
@@ -2748,7 +2756,7 @@ def generate_panel_discussion(
         backend = select_backend()
     return backend.text(
         system=PANEL_SYSTEM_PROMPT, user_text=user_text,
-        model=model, max_tokens=8000, cache=True,
+        model=model, max_tokens=8000,
     )
 
 
@@ -2874,7 +2882,7 @@ def generate_takeaway_prose(
         backend = select_backend()
     return backend.text(
         system=TAKEAWAY_SYSTEM_PROMPT, user_text=user_text,
-        model=model, max_tokens=2000, cache=True,
+        model=model, max_tokens=2000,
     )
 
 
