@@ -173,7 +173,7 @@ These cover **Layer 1 + Layer-3 reporting**. The gap — **real-time enforcement
 
 ## 9. Open questions / next investigations
 
-1. **Gateway deep-dive (top priority per project direction):** stand up a local **LiteLLM** proxy in front of Anthropic; validate per-key `max_budget` hard rejection, daily+monthly windows, OpenAI-compatible passthrough, and the OTel export. Verify the stale-spend bugs (#27735/#24770) don't affect a single-key setup. Decide build-vs-skip for our scale.
+1. ~~**Gateway deep-dive:** stand up a local LiteLLM proxy, validate per-key `max_budget` hard rejection and OpenAI-compatible passthrough.~~ **DONE — see §11.** Real-time cutoff + provider abstraction confirmed; decision: not now for yt2md (needs a stateful Postgres-backed deployment), adopt at the §8 triggers. Remaining gateway threads if pursued: daily+monthly budget *windows*, OTel export, and a second (OpenAI) backend.
 2. **Undocumented Anthropic behavior:** measure key-disable propagation latency and whether an in-flight stream is torn down on disable (no published SLA).
 3. **OTel GenAI conventions:** track the timeline for a standardized `cost` attribute; decide whether to emit `gen_ai.*` from yt2md now for portability.
 4. **In-process wins to revisit if LLM work returns app-side:** Batch API (50% off, fits the pipeline) and shared transcript prompt-caching across stages.
@@ -227,3 +227,36 @@ These cover **Layer 1 + Layer-3 reporting**. The gap — **real-time enforcement
 ---
 
 *Spike compiled from three parallel research threads (Anthropic governance surface · in-process levers · external ecosystem). Endpoint mechanics, parameters, multipliers, and billing rules are from official Anthropic docs; pricing percentages from corroborating third-party analyses (verify with `count_tokens`). One fact remains unpinnable: Anthropic publishes no SLA for API-key-disable propagation latency or in-flight stream termination.*
+
+---
+
+## 11. Hands-on findings — LiteLLM proxy validation (2026-05-30)
+
+Follow-up to §9 item 1. Stood up LiteLLM locally in front of Anthropic (Haiku) to test whether the Layer-2 real-time hard cutoff actually works. Throwaway: ephemeral local Postgres + a `uv` venv, both torn down after. Config artifact: `docs/spikes/litellm/config.yaml`.
+
+### What was proven
+
+1. **Real-time per-request hard cutoff — CONFIRMED.** Minted a virtual key with `max_budget: 0.0001` via `POST /key/generate`, then called the proxy with it:
+   ```
+   call 1–4 → HTTP 200 (ok)
+   call 5   → HTTP 429  budget_exceeded: Current cost: 0.000124, Max budget: 0.0001
+   ```
+   The rejection is returned **by the proxy, before forwarding upstream**. Proof it never billed Anthropic: cumulative cost stayed at exactly `$0.000124` = 4 calls × $0.000031 (11 in × $1/M + 4 out × $5/M); the rejected 5th call added nothing. **This is the Layer-2 capability neither the app-side gate (Layer 1) nor the Admin API (Layer 3) has.**
+
+2. **Provider abstraction — CONFIRMED.** An OpenAI-shaped `POST /v1/chat/completions` with `model: "claude-haiku"` transparently routed to the Anthropic backend. This is the multi-provider chokepoint: the same client call could front OpenAI or Anthropic by config alone.
+
+### The gotchas (as valuable as the success)
+
+3. **A DB-free global `max_budget` is a SILENT NO-OP — a false kill switch.** First attempt used `litellm_settings.max_budget` with no database: the proxy initialized fine, **forwarded all 8 test calls (200 OK), and enforced nothing** — no error, no warning, no spend tracking in the logs. Anyone who sets a global `max_budget` without a DB and assumes they have a budget guard has **zero** enforcement. Budget enforcement lives entirely in LiteLLM's spend/key store.
+
+4. **Real enforcement requires a stateful Postgres + Prisma deployment — not a 2-minute config.** Concretely it needed: a running **Postgres** (no SQLite — Prisma/Postgres only); the `prisma` Python package (**not** pulled by the `litellm[proxy]` extra in this version — installed separately); `prisma generate` (downloads a query-engine binary); and `prisma db push` (creates ~40 `LiteLLM_*` tables). Ephemeral `uv run` envs can't persist the generated Prisma client, so a real venv (or container) is required. **A gateway is infrastructure, not a setting** — it carries DB + service + ops weight.
+
+5. **The known stale-spend bug (#27735/#24770) did NOT manifest** in this single-key setup: spend tracked exactly ($0.000124 = 4×$0.000031). Enforcement is on *cumulative recorded* spend, so it's "reject the next call after breach," not a mid-call abort — consistent with the 5th-call rejection.
+
+### Decision: adopt for yt2md?
+
+**No — not now.** The kill switch is real and works, but it's a **stateful Postgres-backed service** (DB + proxy + HA/ops). For yt2md (personal, single-user, Anthropic-only) that's disproportionate vs. the existing **Console $20 hard cap + app-side soft gate**, which together already bound spend. This confirms §8's decision rule rather than overturning it.
+
+**Adopt when** any of §8's triggers fire: >1 app or >1 user sharing a key; a need for hard *per-team/per-key* budgets; or going multi-provider (Anthropic + OpenAI). At that point **LiteLLM-proxy-on-Postgres is the validated answer** — both the budget kill switch and the provider-abstraction layer in one chokepoint.
+
+**Reusable takeaways for that future:** budget on virtual keys (`/key/generate {max_budget}`), never the DB-free global setting; budget a stateful deployment (Postgres + persisted Prisma client), not a config flag; the OpenAI-compatible endpoint is the provider-portability seam.
