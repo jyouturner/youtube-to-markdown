@@ -1900,9 +1900,24 @@ DEFAULT_MODEL_PRICING: dict = {
 
 
 def _model_pricing(model: str) -> Optional[dict]:
-    """Resolve pricing for a model name. Settings can override via
-    settings['model_pricing'][model]; falls back to the default table.
+    """Resolve pricing for a model name. Resolution order:
+      1. billing-calibrated cache (~/yt2md/pricing_cache.json, when fresh) —
+         merged over the hardcoded fields so a partial calibration keeps the
+         rest of the table.
+      2. settings['model_pricing'][model] override.
+      3. DEFAULT_MODEL_PRICING hardcoded fallback.
+    Returns None for a fully-unknown model so estimate_cost_usd surfaces 'n/a'
+    rather than a silent $0.
     """
+    try:
+        cache = load_pricing_cache()
+        if cache and model in cache:
+            merged = dict(DEFAULT_MODEL_PRICING.get(model) or {})
+            merged.update(cache[model])
+            if merged:
+                return merged
+    except Exception:
+        pass
     try:
         s = load_settings()
         override = (s.get("model_pricing") or {}).get(model)
@@ -1997,6 +2012,387 @@ def read_llm_usage_log() -> List[dict]:
     except OSError:
         pass
     return rows
+
+
+# ====================================================================
+# Admin API: self-calibrating pricing + workspace budget gate
+#
+# yt2md can read its own billing via the Anthropic Admin API (Usage &
+# Cost endpoints; requires an org Admin key, sk-ant-admin...). Two uses:
+#   1. Self-calibrating pricing — derive effective $/Mtok from real
+#      billing so DEFAULT_MODEL_PRICING can't silently go stale.
+#   2. Budget gate — refuse to START a new digest once this workspace's
+#      month-to-date spend crosses a threshold (under any Console cap).
+# Everything degrades gracefully (returns None / allows the action) when
+# no admin key is present, so non-org users are unaffected.
+# ====================================================================
+
+ADMIN_API_BASE = "https://api.anthropic.com"
+PRICING_CACHE_MAX_AGE_DAYS = 30
+_PRICING_DIVERGENCE_GUARD = 3.0    # reject a calibrated rate >3x off the fallback
+_PRICING_MIN_TOKENS = 50_000       # too little volume to trust a rate divide
+_WS_COST_CACHE_TTL_SECS = 300      # cost data is fresh ~5 min; don't poll faster
+
+
+def _admin_api_key() -> Optional[str]:
+    """Resolve the Admin API key. load_env_files() already fills os.environ
+    from repo ./.env and ~/yt2md/.env, so a plain environ read covers the IDE,
+    installed, and shell-export workflows. Returns None when absent."""
+    key = os.environ.get("ANTHROPIC_ADMIN_KEY")
+    if not key:
+        try:
+            load_env_files()
+            key = os.environ.get("ANTHROPIC_ADMIN_KEY")
+        except Exception:
+            key = None
+    return key or None
+
+
+def _admin_get(path: str, params: Optional[dict] = None) -> Optional[dict]:
+    """GET an Admin API endpoint. Returns parsed JSON, or None on any failure
+    (no key, HTTP error, network). Never raises — cost features must not break
+    the pipeline. params values may be lists (repeated query keys, e.g.
+    group_by[])."""
+    import urllib.request, urllib.parse
+    key = _admin_api_key()
+    if not key:
+        return None
+    url = ADMIN_API_BASE + path
+    if params:
+        flat = []
+        for k, v in params.items():
+            if isinstance(v, (list, tuple)):
+                flat.extend((k, str(x)) for x in v)
+            else:
+                flat.append((k, str(v)))
+        url += "?" + urllib.parse.urlencode(flat)
+    req = urllib.request.Request(
+        url, headers={"anthropic-version": "2023-06-01", "x-api-key": key})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)
+    except Exception:
+        return None
+
+
+def _admin_get_pages(path: str, params: dict) -> Optional[List[dict]]:
+    """Fetch all pages of a list endpoint. Returns the concatenated `data`
+    buckets, [] when reachable-but-empty, or None when the API is unreachable
+    (so callers can distinguish 'zero spend' from 'no admin key')."""
+    first = _admin_get(path, params)
+    if first is None:
+        return None
+    out: List[dict] = list(first.get("data", []) or [])
+    page = first
+    p = dict(params)
+    for _ in range(50):  # defensive hard cap
+        if not page.get("has_more"):
+            break
+        nxt = page.get("next_page")
+        if not nxt:
+            break
+        p["page"] = nxt
+        page = _admin_get(path, p)
+        if page is None:
+            break
+        out.extend(page.get("data", []) or [])
+    return out
+
+
+def _utc_iso(dt) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _utc_now_iso() -> str:
+    from datetime import datetime, timezone
+    return _utc_iso(datetime.now(timezone.utc))
+
+
+def _utc_month_start_iso() -> str:
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    return _utc_iso(now.replace(day=1, hour=0, minute=0, second=0, microsecond=0))
+
+
+def _utc_days_ago_iso(days: int) -> str:
+    from datetime import datetime, timezone, timedelta
+    return _utc_iso(datetime.now(timezone.utc) - timedelta(days=days))
+
+
+def _norm_model(s: str) -> str:
+    """Normalize a model id ('claude-opus-4-7', 'claude-haiku-4-5-20251001')
+    or a billing display name ('Claude Opus 4.7') to a join key. Strips a
+    trailing -YYYYMMDD date and all non-alphanumerics: both forms collapse to
+    e.g. 'claudeopus47'."""
+    s = re.sub(r"-20\d{6}$", "", s)
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+# ---- Self-calibrating pricing ----------------------------------------
+
+def fetch_usage_by_model(start_iso: str, end_iso: str) -> Optional[dict]:
+    """Token counts grouped by model over a window:
+    {model_id: {input, output, cache_read, cache_creation}}. None if API down."""
+    pages = _admin_get_pages(
+        "/v1/organizations/usage_report/messages",
+        {"starting_at": start_iso, "ending_at": end_iso,
+         "group_by[]": ["model"], "bucket_width": "1d"})
+    if pages is None:
+        return None
+    tok: dict = {}
+    for bucket in pages:
+        for r in bucket.get("results", []):
+            mdl = r.get("model") or "unknown"
+            d = tok.setdefault(mdl, {"input": 0, "output": 0,
+                                     "cache_read": 0, "cache_creation": 0})
+            d["input"] += int(r.get("uncached_input_tokens", 0) or 0)
+            d["output"] += int(r.get("output_tokens", 0) or 0)
+            d["cache_read"] += int(r.get("cache_read_input_tokens", 0) or 0)
+            d["cache_creation"] += int(r.get("cache_creation_input_tokens", 0) or 0)
+    return tok
+
+
+def fetch_cost_by_description(start_iso: str, end_iso: str) -> Optional[dict]:
+    """Billed USD grouped by description (model + token type) over a window:
+    {description: usd}. None if API down."""
+    pages = _admin_get_pages(
+        "/v1/organizations/cost_report",
+        {"starting_at": start_iso, "ending_at": end_iso,
+         "group_by[]": ["description"], "bucket_width": "1d"})
+    if pages is None:
+        return None
+    out: dict = {}
+    for bucket in pages:
+        for item in bucket.get("results", []):
+            desc = item.get("description") or item.get("model") or "unknown"
+            out[desc] = out.get(desc, 0.0) + float(item.get("amount", "0") or 0) / 100.0
+    return out
+
+
+# Billing-description substrings -> pricing field. Order matters: the
+# cache-write line reads "Input Tokens, Cache Write", so "cache write" must
+# be tested before the bare "input tokens".
+_COST_FIELD_NEEDLES = [
+    ("cache write", "cache_creation"),
+    ("cache read", "cache_read"),
+    ("cache hit", "cache_read"),
+    ("output tokens", "output"),
+    ("input tokens", "input"),
+]
+
+
+def calibrate_pricing_from_billing(lookback_days: int = 14) -> dict:
+    """Derive effective $/Mtok per (model, field) from real billing and write
+    ~/yt2md/pricing_cache.json. Joins usage tokens to cost dollars by a
+    normalized model key. Skips lines with too little volume or a rate that
+    diverges >3x from the hardcoded fallback (guards a mapping bug). Returns a
+    summary dict with ok / derived / warnings."""
+    start, end = _utc_days_ago_iso(lookback_days), _utc_now_iso()
+    usage = fetch_usage_by_model(start, end)
+    cost = fetch_cost_by_description(start, end)
+    if usage is None or cost is None:
+        return {"ok": False, "reason": "admin API unavailable (no key or error)"}
+
+    usage_norm = {_norm_model(mid): {**d, "_id": mid} for mid, d in usage.items()}
+    derived: dict = {}
+    warnings: List[str] = []
+    for desc, usd in cost.items():
+        dl = desc.lower()
+        field = next((f for needle, f in _COST_FIELD_NEEDLES if needle in dl), None)
+        if not field:
+            continue
+        disp = re.split(r"\s+usage", dl)[0]
+        u = usage_norm.get(_norm_model(disp))
+        if not u:
+            continue
+        toks = u.get(field, 0)
+        if toks < _PRICING_MIN_TOKENS:
+            continue
+        rate = usd / (toks / 1_000_000)
+        mid = u["_id"]
+        fb = (DEFAULT_MODEL_PRICING.get(mid) or {}).get(field)
+        if fb and (rate > fb * _PRICING_DIVERGENCE_GUARD
+                   or rate < fb / _PRICING_DIVERGENCE_GUARD):
+            warnings.append(
+                f"{mid}.{field}: billing-implied ${rate:.2f}/M diverges >3x "
+                f"from fallback ${fb}/M — skipped")
+            continue
+        derived.setdefault(mid, {})[field] = round(rate, 4)
+
+    # Merge over any previous cache so a partial pull never wipes known rates.
+    prev: dict = {}
+    p = _pricing_cache_path()
+    if p.exists():
+        try:
+            prev = (json.loads(p.read_text()).get("rates")) or {}
+        except Exception:
+            prev = {}
+    rates = dict(prev)
+    for mid, fields in derived.items():
+        rates.setdefault(mid, {}).update(fields)
+
+    import time as _t
+    payload = {"_source": "anthropic-billing", "_calibrated_at": _utc_now_iso(),
+               "_calibrated_at_epoch": _t.time(), "_lookback_days": lookback_days,
+               "rates": rates}
+    try:
+        get_data_dir().mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(payload, indent=2) + "\n")
+    except OSError:
+        pass
+    return {"ok": True, "derived": derived, "warnings": warnings,
+            "models": list(derived)}
+
+
+def _pricing_cache_path() -> Path:
+    return get_data_dir() / "pricing_cache.json"
+
+
+def load_pricing_cache() -> Optional[dict]:
+    """{model: {field: rate}} from the billing-calibrated cache when present
+    and fresh (< PRICING_CACHE_MAX_AGE_DAYS), else None."""
+    p = _pricing_cache_path()
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+    except Exception:
+        return None
+    import time as _t
+    ts = data.get("_calibrated_at_epoch", 0)
+    if not ts or (_t.time() - ts) > PRICING_CACHE_MAX_AGE_DAYS * 86400:
+        return None
+    return data.get("rates") or None
+
+
+# ---- Workspace budget gate -------------------------------------------
+
+def detect_runtime_workspace_id() -> Optional[str]:
+    """Match the runtime ANTHROPIC_API_KEY to its workspace via the Admin API
+    (by partial_key_hint suffix). Returns the workspace id, or None."""
+    rk = os.environ.get("ANTHROPIC_API_KEY") or ""
+    if len(rk) < 8:
+        return None
+    tail = rk[-4:]
+    keys = _admin_get_pages("/v1/organizations/api_keys", {"limit": 100})
+    if not keys:
+        return None
+    for k in keys:
+        if (k.get("partial_key_hint") or "").endswith(tail):
+            return k.get("workspace_id")
+    return None
+
+
+def fetch_workspace_month_to_date_usd(workspace_id: str) -> Optional[float]:
+    """Month-to-date billed USD for one workspace (group_by workspace_id, sum
+    the matching rows). None if the API is unreachable; 0.0 if reachable with
+    no spend."""
+    pages = _admin_get_pages(
+        "/v1/organizations/cost_report",
+        {"starting_at": _utc_month_start_iso(), "ending_at": _utc_now_iso(),
+         "group_by[]": ["workspace_id"], "bucket_width": "1d"})
+    if pages is None:
+        return None
+    total = 0.0
+    for bucket in pages:
+        for item in bucket.get("results", []):
+            if item.get("workspace_id") == workspace_id:
+                total += float(item.get("amount", "0") or 0) / 100.0
+    return total
+
+
+_ws_cost_cache = {"ts": 0.0, "usd": None, "ws": None}
+
+
+def _local_month_to_date_cost() -> float:
+    """Fallback: sum the local usage log for the current UTC month."""
+    from datetime import datetime, timezone
+    month_start = datetime.now(timezone.utc).replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
+    return sum(float(r.get("cost_usd") or 0)
+               for r in read_llm_usage_log() if (r.get("ts") or 0) >= month_start)
+
+
+def workspace_month_to_date_cost(workspace_id: Optional[str]) -> Optional[float]:
+    """Authoritative month-to-date USD for a workspace (Admin Cost API, cached
+    ~5 min). Falls back to the local usage log when the API is unreachable.
+    Returns None only if there is no workspace and no local data."""
+    import time as _t
+    if workspace_id:
+        c = _ws_cost_cache
+        if (c["ws"] == workspace_id and c["usd"] is not None
+                and (_t.time() - c["ts"]) < _WS_COST_CACHE_TTL_SECS):
+            return c["usd"]
+        usd = fetch_workspace_month_to_date_usd(workspace_id)
+        if usd is not None:
+            _ws_cost_cache.update(ts=_t.time(), usd=usd, ws=workspace_id)
+            return usd
+    return _local_month_to_date_cost()
+
+
+def budget_status() -> dict:
+    """Resolve workspace, month-to-date spend, and the warn/block thresholds.
+    Auto-detects + persists budget_workspace_id on first call when possible."""
+    s = load_settings()
+    ws = s.get("budget_workspace_id") or None
+    if not ws:
+        ws = detect_runtime_workspace_id()
+        if ws:
+            try:
+                s["budget_workspace_id"] = ws
+                save_settings(s)
+            except Exception:
+                pass
+    return {
+        "workspace_id": ws,
+        "month_to_date_usd": workspace_month_to_date_cost(ws),
+        "warn_usd": float(s.get("budget_warn_usd") or 0),
+        "block_usd": float(s.get("budget_block_usd") or 0),
+        "source": "billing" if ws and _admin_api_key() else "local",
+    }
+
+
+def check_budget(action: str = "start a new digest") -> Optional[str]:
+    """Return a human message if the action should be BLOCKED (mtd >= block),
+    else None. Warns to stderr in the warn..block band. Always allows when
+    budget is unconfigured or month-to-date cost is unknown."""
+    try:
+        st = budget_status()
+    except Exception:
+        return None
+    mtd, warn, block = st.get("month_to_date_usd"), st.get("warn_usd") or 0, st.get("block_usd") or 0
+    if mtd is None:
+        return None
+    if block and mtd >= block:
+        return (f"yt2md budget gate: workspace month-to-date spend is "
+                f"${mtd:.2f} >= block threshold ${block:.2f}. Refusing to {action}. "
+                f"Raise budget_block_usd in settings.json or wait until next month "
+                f"(the Console hard cap still applies as a backstop).")
+    if warn and mtd >= warn:
+        sys.stderr.write(f"[yt2md] budget warning: workspace month-to-date "
+                         f"${mtd:.2f} >= warn ${warn:.2f} (block at ${block:.2f}).\n")
+    return None
+
+
+def cmd_refresh_pricing(args) -> int:
+    """yt2md refresh-pricing — recompute the model price table from your actual
+    Anthropic billing (Admin API) and cache it to ~/yt2md/pricing_cache.json."""
+    res = calibrate_pricing_from_billing(lookback_days=args.lookback)
+    if not res.get("ok"):
+        print(f"could not calibrate: {res.get('reason')}")
+        print("(set ANTHROPIC_ADMIN_KEY in the repo .env or ~/yt2md/.env)")
+        return 1
+    if not res["derived"]:
+        print("no model lines had enough billing volume to calibrate "
+              f"(last {args.lookback}d); table unchanged.")
+    else:
+        print(f"calibrated {len(res['derived'])} model(s) from billing "
+              f"(last {args.lookback}d) -> {_pricing_cache_path()}")
+        for mid, fields in res["derived"].items():
+            print(f"  {mid}: " + ", ".join(f"{k}=${v}/M" for k, v in fields.items()))
+    for w in res.get("warnings", []):
+        print(f"  ! {w}")
+    return 0
 
 
 class AnthropicAPIBackend:
@@ -3546,6 +3942,20 @@ DEFAULT_SETTINGS = {
     # ElevenLabs model. eleven_multilingual_v2 is the high-quality default;
     # eleven_turbo_v2_5 is faster + cheaper; eleven_flash_v2_5 is fastest.
     "elevenlabs_model": "eleven_multilingual_v2",
+    # --- Budget gate (requires an Admin key for authoritative billing; falls
+    # back to the local usage log otherwise). Refuses to START a new digest
+    # once this workspace's month-to-date spend crosses block_usd; warns past
+    # warn_usd. A running digest is never interrupted. Any Console spend cap is
+    # an independent hard backstop above these.
+    # budget_workspace_id: auto-detected from the runtime API key on first use;
+    # leave blank to auto-fill, or set explicitly to pin attribution.
+    "budget_workspace_id": "",
+    "budget_warn_usd": 15.0,
+    "budget_block_usd": 18.0,
+    # Per-model price overrides, e.g. {"claude-opus-4-7": {"input": 5.0, ...}}.
+    # Lowest precedence after the billing-calibrated cache; mainly an escape
+    # hatch. Registered here so load_settings() doesn't filter it out.
+    "model_pricing": {},
 }
 
 
@@ -5443,6 +5853,14 @@ def digest_video(
             "digest": load_digest_json(video_id, digests_dir=digests_dir),
         }
 
+    # Budget gate: refuse to start a new digest once month-to-date workspace
+    # spend crosses the block threshold. Returns a status dict (rather than
+    # raising) so programmatic callers — CLI, MCP tool, web — handle it
+    # uniformly. None == allowed.
+    _blocked = check_budget(action=f"digest {video_id}")
+    if _blocked:
+        return {"video_id": video_id, "status": "blocked", "reason": _blocked}
+
     digest_path = digests_dir / video_id / "digest.md"
     digest_path.parent.mkdir(parents=True, exist_ok=True)
     log_path = get_data_dir() / "logs" / "oneoff.log"
@@ -6871,6 +7289,20 @@ def cmd_serve(args) -> int:
     data_dir = get_data_dir()
     digests_dir = data_dir / "digests"
 
+    # Opportunistic, non-fatal: refresh billing-calibrated pricing if the cache
+    # is missing or older than 7 days. No-op without an Admin key.
+    try:
+        _pc = _pricing_cache_path()
+        import time as _t
+        _stale = (not _pc.exists()
+                  or (_t.time() - (json.loads(_pc.read_text()).get("_calibrated_at_epoch", 0))) > 7 * 86400)
+        if _stale and _admin_api_key():
+            _res = calibrate_pricing_from_billing()
+            if _res.get("ok") and _res.get("derived"):
+                print(f"[yt2md] refreshed pricing from billing: {', '.join(_res['models'])}")
+    except Exception:
+        pass
+
     app = Flask(__name__)
     # Disable Flask's default request logging — keep stdout clean.
     import logging
@@ -8206,6 +8638,26 @@ def cmd_serve(args) -> int:
 
         body = "<h1>Activity</h1>"
         body += '<p class="meta-info">Every completed one-off digest, success or failure. Persists across server restarts.</p>'
+
+        # Budget gate status: this workspace's month-to-date spend vs the
+        # warn/block thresholds. Defensive — never break Activity if the Admin
+        # API is unreachable.
+        try:
+            _bs = budget_status()
+            _mtd = _bs.get("month_to_date_usd")
+            if _mtd is not None and (_bs.get("block_usd") or _bs.get("warn_usd")):
+                _warn, _block = _bs.get("warn_usd") or 0, _bs.get("block_usd") or 0
+                _color = "#c0392b" if (_block and _mtd >= _block) else (
+                    "#e67e22" if (_warn and _mtd >= _warn) else "#27ae60")
+                _src = "billing" if _bs.get("source") == "billing" else "local log (no admin key)"
+                body += (
+                    f'<p class="meta-info" style="border-left:3px solid {_color};'
+                    f'padding-left:8px">Budget (this workspace, month-to-date): '
+                    f'<strong style="color:{_color}">${_mtd:.2f}</strong> '
+                    f'&middot; warn ${_warn:.0f} &middot; block ${_block:.0f} '
+                    f'&middot; <span style="opacity:.7">source: {h(_src)}</span></p>')
+        except Exception:
+            pass
 
         # Cost summary across windows. Reads the central LLM usage log once
         # and bucket-totals — cheap, runs in a few ms even with thousands
@@ -10203,6 +10655,15 @@ def _subcommand_main(argv: List[str]) -> int:
                          help="Print what would be tagged without calling the LLM")
     retro_p.set_defaults(func=cmd_retrofit_topics)
 
+    refresh_p = sub.add_parser(
+        "refresh-pricing",
+        help="Recalibrate the model price table from your actual Anthropic "
+             "billing (Admin API) and cache it",
+    )
+    refresh_p.add_argument("--lookback", type=int, default=14, metavar="DAYS",
+                           help="Billing window to derive rates from (default: 14)")
+    refresh_p.set_defaults(func=cmd_refresh_pricing)
+
     args = ap.parse_args(argv)
     return args.func(args)
 
@@ -10215,7 +10676,7 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] in (
         "watch", "serve", "doctor", "mcp",
         "list", "read", "search", "digest", "topics", "retrofit-topics",
-        "project-instructions",
+        "project-instructions", "refresh-pricing",
     ):
         load_env_files()
         sys.exit(_subcommand_main(sys.argv[1:]))
@@ -10326,6 +10787,13 @@ def main():
     do_digest = not args.deck_only
     if do_digest:
         ensure_api_key()
+        # Budget gate (worker side): covers direct `yt2md <url>` and the
+        # subprocesses spawned by digest_video / the scheduler. Checked once at
+        # the start of the pipeline, never mid-run, so a started digest always
+        # finishes. --deck-only makes no LLM calls, so it's exempt.
+        _blocked = check_budget(action="run this digest")
+        if _blocked:
+            sys.exit(_blocked)
 
     import time as _time
     timings: dict = {}
