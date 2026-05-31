@@ -61,6 +61,88 @@ Each domain is a real sub-market with its own options:
 | **Policy / compliance** | inventory, risk tiering, audit, approvals, framework mapping | **EU AI Act high-risk obligations apply 2 Aug 2026** — the hard deadline anchoring requirements |
 | **Operating model** | ownership: platform team + CoE + FinOps + governance board; self-service portal | **Hub-and-spoke** (central standards, BU autonomy) is the recommended shape |
 
+The table is the map; the rest of this section is the territory. Each domain is treated as: *what it governs · the capability checklist · the non-obvious depth · the failure mode if you skip it.*
+
+### 2.1 Gateway (the control plane)
+
+**What it governs.** The single egress point between every application/agent and every model provider — the one place to enforce a uniform policy set *regardless of which model is called*. Everything else in the stack either feeds the gateway (identity, policy) or consumes what it emits (observability, FinOps, compliance).
+
+**Capability checklist.** Unified/OpenAI-compatible API · provider abstraction (swap Anthropic↔OpenAI↔Bedrock without code change) · **virtual keys** · hierarchical per-key/team/org budgets with hard cutoffs and auto-reset windows · rate limiting · routing / fallback / load-balancing · semantic + response caching · retries · unified request/response logging (the audit trail) · optional inline guardrails.
+
+**The non-obvious depth.** The *virtual key* is the atomic governance object — it carries budget, rate limit, model allow-list, routing policy, *and* tenant identity. You issue scoped virtual keys to consumers and keep the real provider keys in a vault behind the gateway; the virtual key is simultaneously your access control, your budget binding, and your tenant-isolation boundary. The gateway is also the **only** layer that can do a *real-time, per-request, hard* cutoff (the "Layer 2" of the cost-control guide) — provider billing APIs only report, and app-side gates only cover one app. Budgets are hierarchical: a request must pass the key budget *and* the team budget *and* the org budget.
+
+**Failure mode if skipped.** Every team holds raw provider keys; no central budget, audit, or policy; nobody can answer "how much are we spending, by app, by team, by customer" — or stop a runaway anywhere but at the provider's monthly cap.
+
+### 2.2 Observability + evaluation + prompt management (the quality plane)
+
+**What it governs.** The "is it working, and can I prove it" trio: *see* what every call did, *measure* whether the output is good, and *version* the prompt as an approvable change unit.
+
+**Capability checklist.** *Observability:* per-call tokens/cost/latency/full I/O, span-level traces for multi-step agents, dashboards, alerting — this **is** the audit evidence. *Evaluation:* offline (run scorers against a fixed dataset in CI — the regression gate) and online (run scorers on live production traces — drift detection), usually via LLM-as-judge plus deterministic checks. *Prompt management:* versioning, diff, rollback, environment-pinned deployment, decoupled from code so non-engineers iterate without a deploy.
+
+**The non-obvious depth.** "Prompt versioning without evals is just diff tracking" — a registry only becomes a *governance control* when each version is gated by evals and linked to the traces it produced. This trio is also the mechanism for **safely cutting cost**: hold a curated eval set, run the cheaper/smaller model against it offline, gate the downgrade on the scores holding, then watch online evals post-deploy for drift. No tool ships a turnkey "downgrade the model" button — you assemble it from the eval-gate + online-monitor primitives. And for audit, the trace store must outlive the vendor — favor OSS/self-host or OpenTelemetry-native exports (see the SaaS-continuity casualties in §3.2).
+
+**Failure mode if skipped.** You can't prove what a model did (no audit trail), can't tell whether a prompt/model change degraded quality, and can't roll back a bad prompt without a code deploy.
+
+### 2.3 Safety / AI security (the protection plane)
+
+**What it governs.** Keeping adversarial or sensitive *inputs* out and unsafe or leaky *outputs* in — across two sub-concerns: **content safety** (guardrails) and **security posture** (attacks and testing).
+
+**Capability checklist.** *Guardrails (inline rails):* prompt-injection / jailbreak detection (direct, indirect/RAG-embedded, and multimodal), PII detection + redaction, toxicity / content moderation, hallucination / contextual-grounding checks, topic / scope control, DLP / exfiltration prevention — applied as input rails and output rails. *Security posture:* threat modeling against the **OWASP Top-10 for LLM Applications (2025)**, out-of-band red-teaming (PyRIT, Garak, Promptfoo) before deployment, and provider-key secrets hygiene.
+
+**The non-obvious depth.** Make coverage *auditable* by mapping every runtime control and every red-team probe back to an OWASP LLM0x code (e.g. LLM01 Prompt Injection, LLM06 Excessive Agency, LLM07 System-Prompt Leakage, LLM10 Unbounded Consumption — the last one is literally a cost/denial-of-wallet risk, which is why safety and FinOps overlap). The standalone runtime-guardrail market **consolidated into security suites in 2025** (Lakera→Check Point, Prompt Security→SentinelOne, Protect AI→Palo Alto, Robust Intelligence→Cisco) — the signal being *buy* guardrail detection rather than build it, because detection quality is a moving research target. PII redaction (e.g. Presidio) is necessary but **never complete** — layer it, and redact *before* you log so the audit trail itself doesn't become a PII liability.
+
+**Failure mode if skipped.** Indirect prompt injection exfiltrates data through a RAG document; PII lands in logs or responses; an over-empowered agent takes a destructive action; a denial-of-wallet attack runs your bill up.
+
+### 2.4 FinOps for AI (the cost plane)
+
+**What it governs.** The financial-management discipline for AI spend: allocate it, charge it back, forecast it, and optimize it — the org-scale version of everything in the cost-control guide.
+
+**Capability checklist.** Cost allocation + showback/chargeback to teams/cost-centers · **unit economics** (cost per request / feature / customer / job) · forecasting · budget alerts · anomaly detection · committed-spend / discount / GPU-capacity management.
+
+**The non-obvious depth.** AI spend behaves *unlike* traditional cloud spend, which is why the FinOps Foundation made "FinOps for AI" a formal **Scope** in 2025: it's priced in volatile *tokens* not stable compute-hours, a small prompt/config change can swing cost disproportionately (so forecast windows shrink), **non-technical teams drive the spend**, research models quietly graduate into production, and GPU scarcity pushes you toward commitments. Practically you need **two tool families** — a finance-facing FinOps platform (allocation/chargeback: CloudZero, Vantage, Finout) *and* an engineer-facing observability tool (per-request tracing) — because neither does the other's job. **Unit economics** (cost-per-customer/feature) is the underserved frontier and the thing leadership actually wants. Sequence it **showback before chargeback**, crawl/walk/run.
+
+**Failure mode if skipped.** Surprise bills; no idea which feature or customer is unprofitable; can't forecast; finance and engineering argue over an undivided lump sum.
+
+### 2.5 Agent / MCP governance (the 2026 frontier)
+
+**What it governs.** Not just model *calls* but the *tools, MCP servers, and autonomous agents* the org runs — a distinct, fast-emerging plane as agentic systems proliferate (Gartner: ~40% of enterprise apps will embed task-specific agents by 2026, up from <5% in 2025).
+
+**Capability checklist.** Tool/agent **registries** with approval workflows · per-tool RBAC · tool discovery / semantic search (to solve "tool overload") · audit of every tool invocation · agent lifecycle management (register → approve → monitor → **decommission**).
+
+**The non-obvious depth.** Agent estates develop their own pathologies that classic governance doesn't name: *functional duplication* (five teams build the same agent), *shadow agents* (ungoverned, unknown to the platform team), *orphaned agents* (still running and spending after their owner left), *permission creep*, and *unmonitored delegation* (agent calls agent calls tool). The governance primitives mirror the gateway list but add the registry + per-tool RBAC + invocation audit. This shipped across the majors in 2026 — **AWS Agent Registry** (AgentCore), **Databricks Unity** AI Gateway, **Azure API Center**, and OSS **agentgateway** — and it interacts with cost: one agent "turn" can be 20+ internal model+tool calls, which is exactly what breaks per-request/per-log billing meters.
+
+**Failure mode if skipped.** Orphaned agents burn budget and hold live credentials indefinitely; an agent invokes a tool it should never touch; no audit of what autonomous actions were actually taken.
+
+### 2.6 Identity / access (the cross-cutting foundation)
+
+**What it governs.** *Who* (which human) and *what* (which app/agent) may call which models and tools, with which budget — and where the underlying credentials live. It sits *across* every other domain rather than beside them.
+
+**Capability checklist.** SSO / SCIM (tie to corporate identity) · RBAC · **virtual keys** as the access + tenant-isolation primitive · secrets management (vault) · model allow-lists per consumer · OAuth machine-to-machine flows for agents.
+
+**The non-obvious depth.** The single most important rule: **issue scoped virtual keys, never distribute raw provider keys.** A virtual key is access control, budget binding, and tenant isolation in one object, and it can be revoked surgically without touching anyone else. Raw provider keys belong in a vault (AWS Secrets Manager / Azure Key Vault / GCP Secret Manager / HashiCorp Vault), fetched by the gateway at runtime — *never* in config files or environment variables of individual apps. Map virtual keys back to corporate identity through the gateway's SSO so spend and actions attribute to a real person or service.
+
+**Failure mode if skipped.** A leaked raw key spends unbounded and can't be revoked without breaking other apps; you can't tie spend or an incident to a person; no tenant isolation between teams sharing infrastructure.
+
+### 2.7 Policy / compliance (the documentation plane)
+
+**What it governs.** The system-of-record that lets you *prove* governance to an auditor or regulator — distinct from, and out-of-band relative to, the runtime planes above.
+
+**Capability checklist.** Model / AI-system **inventory** (including third-party and vendor models) · per-system **risk classification** · **model cards** documenting capabilities and limits · **immutable audit logs** of prompts and decisions · **approvals / human-in-the-loop** workflows · auto-generated compliance reports mapped to frameworks.
+
+**The non-obvious depth.** The requirements here are *driven by external frameworks*, so build one control set and map it to all of them: the **EU AI Act** (binding law; high-risk obligations apply **2 Aug 2026**; fines up to €35M or 7% of global turnover) demands risk management, data governance, logging, human oversight, and conformity assessment; **NIST AI RMF** (Govern/Map/Measure/Manage) structures the controls; **ISO/IEC 42001** is the certifiable AI-management-system standard; **SOC 2** covers the access/confidentiality controls on the prompt path. NIST publishes an official RMF→ISO-42001 crosswalk, and both are the common route to EU AI Act readiness. Crucial buyer's caveat: **most "all-in-one AI governance" platforms (Credo AI, OneTrust, IBM watsonx.governance, Holistic AI) live *only* on this plane** — they document and orchestrate policy but do **not** enforce inline at request time. You need this *and* the runtime planes.
+
+**Failure mode if skipped.** You can't demonstrate compliance; EU AI Act high-risk non-compliance risks 7%-of-turnover fines; no record of who approved which system or why.
+
+### 2.8 Operating model (the human layer)
+
+**What it governs.** Who actually *owns and runs* everything above — the organizational design without which the technology becomes either a bottleneck or a free-for-all.
+
+**Capability checklist (roles).** **AI Platform Team** — runs the gateway *as a product* (the control plane, SLAs, key issuance). **AI Center of Excellence (CoE)** — sets strategy, governance *standards*, best practices, enablement. **AI Governance Committee / Board** — evaluates initiatives on value/feasibility/risk, allocates capacity, resolves cross-BU conflicts. **FinOps practice** — owns allocation/chargeback/forecasting.
+
+**The non-obvious depth.** The recommended shape is **hub-and-spoke**: a lean center sets standards (governance, evals, guardrails, FinOps) while business units build use cases on the shared platform — *central standards with BU autonomy*. The classic failure is the **CoE that owns delivery instead of standards** and becomes a bottleneck (every project routes through one team). The scaling mechanism is an **internal developer portal** (Backstage-style) offering **self-service governed key issuance**: developers browse a catalog, sandbox-test, mint scoped keys, and watch their own usage *without filing a ticket*. In 2026 these portals are adding MCP-tool registration and OAuth M2M flows so agents can be consumers too.
+
+**Failure mode if skipped.** Either a central team becomes a ticket queue that throttles every AI initiative, or ungoverned federation lets every BU reinvent (and re-misconfigure) the stack independently.
+
 ---
 
 ## 3. Options per layer — build (OSS) vs buy (commercial) vs cloud-native
