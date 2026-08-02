@@ -1961,22 +1961,31 @@ def record_llm_usage(
     model: str,
     backend_name: str,
     usage,
+    batch: bool = False,
 ) -> dict:
     """Append a single usage record to ~/yt2md/logs/llm_usage.jsonl and
     return the recorded dict. Cost is set to 0.0 for the claude-code backend
     (subscription bills the user via their Anthropic plan, not per-call) so
     the audit log stays consistent — token counts still recorded for
     rate-limit awareness.
+
+    batch=True: the call went through the Message Batches API, which bills at
+    50% of standard token rates. `_model_pricing` only knows full rates, so we
+    halve the estimate here (and stamp `batch: true`) — otherwise the Activity
+    cost view would silently overstate batched calls by 2x.
     """
     import time as _t
 
     cost = 0.0 if backend_name == "claude-code" else estimate_cost_usd(model, usage)
+    if batch:
+        cost *= 0.5
     entry = {
         "ts": _t.time(),
         "video_id": video_id or "",
         "kind": kind,
         "model": model,
         "backend": backend_name,
+        "batch": bool(batch),
         "input_tokens": int(getattr(usage, "input_tokens", 0) or 0),
         "output_tokens": int(getattr(usage, "output_tokens", 0) or 0),
         "cache_read_input_tokens": int(getattr(usage, "cache_read_input_tokens", 0) or 0),
@@ -2435,6 +2444,68 @@ class AnthropicAPIBackend:
             output_format=schema,
         )
         return response.parsed_output, response.usage
+
+    def text_batch(self, requests, *, poll_secs: float = 20.0,
+                   timeout_secs: float = 7200.0, log=None) -> dict:
+        """Submit many text() calls as ONE Message Batch — 50% off all tokens.
+
+        `requests`: iterable of (custom_id, system, user_text, model, max_tokens).
+        Blocks, polling until the batch ends or `timeout_secs` elapses. Returns
+        {custom_id: (text, usage)} for succeeded results only; the caller
+        reconciles any missing custom_ids (errored / expired / still-running at
+        timeout) — typically by falling back to a synchronous call.
+
+        Async by design (batches usually finish in minutes, up to 24h) — only
+        call this off the interactive path. Results come back unordered, so we
+        key strictly by custom_id.
+        """
+        import time as _t
+        from anthropic.types.message_create_params import (
+            MessageCreateParamsNonStreaming,
+        )
+        from anthropic.types.messages.batch_create_params import Request
+
+        reqs = [
+            Request(
+                custom_id=cid,
+                params=MessageCreateParamsNonStreaming(
+                    model=model, max_tokens=mt, system=system,
+                    messages=[{"role": "user",
+                               "content": [{"type": "text", "text": ut}]}],
+                ),
+            )
+            for (cid, system, ut, model, mt) in requests
+        ]
+        if not reqs:
+            return {}
+        batch = self._client.messages.batches.create(requests=reqs)
+        if log:
+            log(f"batch {batch.id} submitted ({len(reqs)} request(s))")
+        deadline = _t.monotonic() + timeout_secs
+        while True:
+            b = self._client.messages.batches.retrieve(batch.id)
+            if b.processing_status == "ended":
+                break
+            if _t.monotonic() > deadline:
+                # Rare: batches almost always finish well inside the window.
+                # Bail on the wait and let the caller sync-fall-back. (A future
+                # refinement: persist batch.id and reconcile on the next poll
+                # instead of blocking here.)
+                if log:
+                    log(f"batch {batch.id} still '{b.processing_status}' after "
+                        f"{int(timeout_secs)}s — abandoning the wait")
+                return {}
+            _t.sleep(poll_secs)
+        out: dict = {}
+        for r in self._client.messages.batches.results(batch.id):
+            if r.result.type == "succeeded":
+                msg = r.result.message
+                text = next((blk.text for blk in msg.content
+                             if blk.type == "text"), "")
+                out[r.custom_id] = (text, msg.usage)
+            elif log:
+                log(f"batch result {r.custom_id}: {r.result.type}")
+        return out
 
 
 class ClaudeCodeBackend:
@@ -3104,22 +3175,19 @@ PANEL_SYSTEM_PROMPT = (
 )
 
 
-def generate_panel_discussion(
+def build_panel_request(
     digest_md_text: str,
     segments: List["TranscriptSegment"],
+    *,
     model: str,
     source_lang: str = "en",
     output_language: str = "auto",
-    backend=None,
-):
-    """Call Claude to simulate a panel of domain-relevant experts discussing a video.
-    Returns (markdown_text, usage).
-
-    source_lang / output_language follow the same convention as generate_digest:
-    'auto' writes the panel in the transcript's language; 'en' forces English.
-
-    Costs ~one Opus call per click (≈ 4–8k input + 2–4k output tokens). Output is
-    one markdown document the caller writes to digests/<id>/panel.md.
+) -> Tuple[str, str, int]:
+    """Assemble (system, user_text, max_tokens) for a panel call — the single
+    source of truth for the panel prompt. Shared by the synchronous path
+    (generate_panel_discussion) and the batched background path
+    (batch_panels_for_videos). `model` is accepted for symmetry / future
+    per-model prompt tweaks; the prompt is currently model-agnostic.
     """
     transcript_str = "\n".join(
         f"[{format_timestamp(seg.start)}] {seg.text}" for seg in segments
@@ -3147,12 +3215,35 @@ def generate_panel_discussion(
         f"{lang_directive}\n\n"
         "Now: introduce the panelists, then run the discussion."
     )
+    return PANEL_SYSTEM_PROMPT, user_text, 8000
 
+
+def generate_panel_discussion(
+    digest_md_text: str,
+    segments: List["TranscriptSegment"],
+    model: str,
+    source_lang: str = "en",
+    output_language: str = "auto",
+    backend=None,
+):
+    """Call Claude to simulate a panel of domain-relevant experts discussing a video.
+    Returns (markdown_text, usage).
+
+    source_lang / output_language follow the same convention as generate_digest:
+    'auto' writes the panel in the transcript's language; 'en' forces English.
+
+    Costs ~one Opus call per click (≈ 4–8k input + 2–4k output tokens). Output is
+    one markdown document the caller writes to digests/<id>/panel.md.
+    """
+    system, user_text, max_tokens = build_panel_request(
+        digest_md_text, segments, model=model,
+        source_lang=source_lang, output_language=output_language,
+    )
     if backend is None:
         backend = select_backend()
     return backend.text(
-        system=PANEL_SYSTEM_PROMPT, user_text=user_text,
-        model=model, max_tokens=8000,
+        system=system, user_text=user_text,
+        model=model, max_tokens=max_tokens,
     )
 
 
@@ -3212,27 +3303,21 @@ TAKEAWAY_SYSTEM_PROMPT = (
 )
 
 
-def generate_takeaway_prose(
+def build_takeaway_request(
     digest_md_text: str,
     panel_md_text: Optional[str],
     segments: List["TranscriptSegment"],
-    model: str,
     *,
+    model: str,
     publish_date: Optional[str] = None,
     source_lang: str = "en",
     output_language: str = "auto",
-    backend=None,
-):
-    """Final pipeline step: write the audience-facing takeaway as 1-3 short
-    paragraphs of prose. Synthesizes digest + panel into a personal
-    'what to walk away with' read.
-
-    publish_date: YYYYMMDD or YYYY-MM-DD as returned by yt-dlp's
-    `info["upload_date"]`; threaded into the prompt so time-sensitive
-    takeaways can anchor with 'as of <date>'.
-
-    Returns (takeaway_text: str, usage). The text contains [M:SS] bracket
-    markers that the renderer converts into clickable timestamp links.
+) -> Tuple[str, str, int]:
+    """Assemble (system, user_text, max_tokens) for a takeaway call — the single
+    source of truth for the takeaway prompt. Shared by the synchronous path
+    (generate_takeaway_prose) and the batched background path
+    (batch_takeaways_for_videos). Returns the raw takeaway text inputs; callers
+    apply render_takeaway_markdown to the model output afterward.
     """
     transcript_str = "\n".join(
         f"[{format_timestamp(seg.start)}] {seg.text}" for seg in segments
@@ -3273,12 +3358,41 @@ def generate_takeaway_prose(
         f"{lang_directive}\n\n"
         "Now: write the takeaway."
     )
+    return TAKEAWAY_SYSTEM_PROMPT, user_text, 2000
 
+
+def generate_takeaway_prose(
+    digest_md_text: str,
+    panel_md_text: Optional[str],
+    segments: List["TranscriptSegment"],
+    model: str,
+    *,
+    publish_date: Optional[str] = None,
+    source_lang: str = "en",
+    output_language: str = "auto",
+    backend=None,
+):
+    """Final pipeline step: write the audience-facing takeaway as 1-3 short
+    paragraphs of prose. Synthesizes digest + panel into a personal
+    'what to walk away with' read.
+
+    publish_date: YYYYMMDD or YYYY-MM-DD as returned by yt-dlp's
+    `info["upload_date"]`; threaded into the prompt so time-sensitive
+    takeaways can anchor with 'as of <date>'.
+
+    Returns (takeaway_text: str, usage). The text contains [M:SS] bracket
+    markers that the renderer converts into clickable timestamp links.
+    """
+    system, user_text, max_tokens = build_takeaway_request(
+        digest_md_text, panel_md_text, segments, model=model,
+        publish_date=publish_date, source_lang=source_lang,
+        output_language=output_language,
+    )
     if backend is None:
         backend = select_backend()
     return backend.text(
-        system=TAKEAWAY_SYSTEM_PROMPT, user_text=user_text,
-        model=model, max_tokens=2000,
+        system=system, user_text=user_text,
+        model=model, max_tokens=max_tokens,
     )
 
 
@@ -3709,6 +3823,7 @@ def _list_channel_videos(url: str, limit: int = LATEST_LIMIT) -> List[str]:
 
 def _digest_video(
     video_id: str, output_dir: Path, *, source: str = "subscription",
+    defer_panel: bool = False,
 ) -> Tuple[int, str]:
     """Run yt2md on a video. Returns (exit_code, combined_stdout_stderr).
 
@@ -3717,13 +3832,21 @@ def _digest_video(
     permanent-failure patterns.
 
     `source` is stamped into digest_meta as the ingestion provenance.
+
+    defer_panel=True: pass `--no-panel --no-takeaway` so the per-video
+    subprocess writes the digest (and slides) but skips the two text calls —
+    the caller then generates them in one Message Batch across all videos in
+    the poll (50% off). Only meaningful when the API backend is active.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     digest_path = output_dir / "digest.md"
     yt2md = shutil.which("yt2md") or sys.argv[0]
+    cmd = [yt2md, f"https://youtu.be/{video_id}", "-o", str(digest_path),
+           "--source", source]
+    if defer_panel:
+        cmd += ["--no-panel", "--no-takeaway"]
     proc = subprocess.Popen(
-        [yt2md, f"https://youtu.be/{video_id}", "-o", str(digest_path),
-         "--source", source],
+        cmd,
         cwd=output_dir,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -3773,6 +3896,13 @@ def cmd_watch_run(args) -> int:
     state = load_state()
     any_failures = False
 
+    # When the API backend is active, defer the panel + takeaway text calls out
+    # of each per-video subprocess and run them as ONE Message Batch across the
+    # whole poll (50% off). PTY / claude-code have no batch endpoint, so those
+    # keep generating inline in the subprocess (use_batch=False).
+    use_batch = _batch_capable()
+    batch_vids: list = []
+
     for channel_url in channels:
         print(f"--- {channel_url}")
         seen = set(state["channels"].get(channel_url, {}).get("seen", []))
@@ -3791,11 +3921,14 @@ def cmd_watch_run(args) -> int:
         print(f"  {len(new_ids)} new: {new_ids}")
         for vid in reversed(new_ids):
             print(f"  processing {vid}...")
-            rc, output = _digest_video(vid, digests_dir / vid)
+            rc, output = _digest_video(vid, digests_dir / vid,
+                                       defer_panel=use_batch)
             if rc == 0:
                 seen.add(vid)
                 state["channels"][channel_url] = {"seen": sorted(seen)}
                 save_state(state)
+                if use_batch:
+                    batch_vids.append(vid)
             elif _is_permanent_failure(output):
                 # Permanent: mark seen so polling stops cycling on it.
                 # Wipe the partial dir (mp4 download, empty digest, etc.) to
@@ -3808,6 +3941,23 @@ def cmd_watch_run(args) -> int:
             else:
                 print(f"  FAILED on {vid} (transient — will retry next poll)", file=sys.stderr)
                 any_failures = True
+
+    # Batched text calls for everything digested this poll. Panels first so the
+    # takeaways can integrate them. Both reconcile any misses with a sync build,
+    # so a batch hiccup never leaves a video without its panel/takeaway. The
+    # video is already marked seen (digest succeeded), so a failure here only
+    # costs the batch discount, not the digest — and the web buttons can still
+    # regenerate on demand.
+    if use_batch and batch_vids:
+        print(f"--- batching panel + takeaway for {len(batch_vids)} video(s) "
+              "via Message Batches (50% off)")
+        try:
+            batch_panels_for_videos(batch_vids, digests_dir=digests_dir)
+            batch_takeaways_for_videos(batch_vids, digests_dir=digests_dir)
+        except Exception as e:
+            print(f"  [warn] batched generation failed ({type(e).__name__}: {e}); "
+                  "panels/takeaways can be regenerated from the reader",
+                  file=sys.stderr)
 
     save_state(state)
     return 1 if any_failures else 0
@@ -5717,6 +5867,166 @@ def build_takeaway_for_video(
     _atomic_write_text(takeaway_path, body)
     _atomic_write_json(takeaway_json_path, takeaway_text_to_json(body))
     return takeaway_path
+
+
+# ---- batched background generation (Message Batches API, 50% off) ----
+#
+# The panel is the single biggest LLM line (~40% of per-video cost) and the
+# takeaway is the next text call. Both run today inside the per-video digest
+# subprocess. For the *background* subscription path (`watch run` / scheduler)
+# nobody is waiting on the result, so we can route those calls through the
+# Message Batches API — a flat 50% token discount — in exchange for async
+# latency (usually minutes, up to 24h). The discount is per-request, so even a
+# batch of one video pays off; fanning out across a whole poll just saves
+# round-trips. The interactive paths (web "Generate panel" button, synchronous
+# one-off) stay on the direct API — someone is watching those.
+
+def _batch_capable() -> bool:
+    """True when the resolved backend is the Anthropic API — the only backend
+    with a Message Batches endpoint. PTY / claude-code have no batch path, so
+    the caller keeps generating panels/takeaways synchronously for those.
+    """
+    try:
+        return isinstance(select_backend(), AnthropicAPIBackend)
+    except Exception:
+        return False
+
+
+def batch_panels_for_videos(
+    video_ids,
+    *,
+    digests_dir: Optional[Path] = None,
+    log=print,
+) -> None:
+    """Generate panels for several already-digested videos via ONE Message
+    Batch (50% off). Writes panel.md/.json per video and records usage with
+    batch=True. Any video the batch didn't return (per-item error, or the whole
+    batch timing out) falls back to synchronous build_panel_for_video so a video
+    is never left without a panel. Off the interactive path only.
+    """
+    if digests_dir is None:
+        digests_dir = get_data_dir() / "digests"
+    s = load_settings()
+    panel_model = s.get("panel_model") or DEFAULT_PANEL_MODEL
+    output_language = s.get("digest_language") or "auto"
+
+    requests: list = []
+    pending: list = []  # video_ids we actually submitted (for reconciliation)
+    for vid in video_ids:
+        if (digests_dir / vid / "panel.md").exists():
+            continue  # skip-if-exists: a re-poll must not resubmit
+        digest_md = digests_dir / vid / "digest.md"
+        if not digest_md.exists():
+            continue
+        try:
+            srt_path, lang = _resolve_cached_srt_for(vid, digests_dir)
+        except Exception as e:
+            log(f"  [warn] {vid}: no cached transcript for panel batch ({e})")
+            continue
+        segments = parse_srt(srt_path)
+        system, user_text, max_tokens = build_panel_request(
+            digest_md.read_text(), segments, model=panel_model,
+            source_lang=lang, output_language=output_language,
+        )
+        requests.append((vid, system, user_text, panel_model, max_tokens))
+        pending.append(vid)
+
+    if not requests:
+        return
+    backend = AnthropicAPIBackend()
+    log(f"[+] Batching {len(requests)} panel call(s) via Message Batches "
+        f"(50% off) with {panel_model}...")
+    results = backend.text_batch(requests, log=lambda m: log(f"      {m}"))
+
+    for vid in pending:
+        got = results.get(vid)
+        if got is None:
+            log(f"  [warn] {vid}: absent from panel batch — synchronous fallback")
+            try:
+                build_panel_for_video(vid, digests_dir=digests_dir)
+            except Exception as e:
+                log(f"  [warn] {vid}: panel fallback failed ({e})")
+            continue
+        text, usage = got
+        record_llm_usage(
+            video_id=vid, kind="panel", model=panel_model,
+            backend_name=backend.name, usage=usage, batch=True,
+        )
+        _atomic_write_text(digests_dir / vid / "panel.md", text)
+        _atomic_write_json(digests_dir / vid / "panel.json",
+                           panel_text_to_json(text))
+        log(f"      panel -> {vid}")
+
+
+def batch_takeaways_for_videos(
+    video_ids,
+    *,
+    digests_dir: Optional[Path] = None,
+    log=print,
+) -> None:
+    """Generate takeaways for several digested videos via ONE Message Batch
+    (50% off). Run this AFTER batch_panels_for_videos so each takeaway can pick
+    up the just-written panel.md (it copes without one). Same reconcile/fallback
+    contract as the panel batch. Off the interactive path only.
+    """
+    if digests_dir is None:
+        digests_dir = get_data_dir() / "digests"
+    s = load_settings()
+    takeaway_model = (os.environ.get("YT2MD_TAKEAWAY_MODEL")
+                      or DEFAULT_TAKEAWAY_MODEL)
+    output_language = s.get("digest_language") or "auto"
+
+    requests: list = []
+    pending: list = []
+    for vid in video_ids:
+        if (digests_dir / vid / "takeaway.md").exists():
+            continue
+        digest_md = digests_dir / vid / "digest.md"
+        if not digest_md.exists():
+            continue
+        try:
+            srt_path, lang = _resolve_cached_srt_for(vid, digests_dir)
+        except Exception as e:
+            log(f"  [warn] {vid}: no cached transcript for takeaway batch ({e})")
+            continue
+        panel_md_path = digests_dir / vid / "panel.md"
+        panel_text = panel_md_path.read_text() if panel_md_path.exists() else None
+        segments = parse_srt(srt_path)
+        system, user_text, max_tokens = build_takeaway_request(
+            digest_md.read_text(), panel_text, segments, model=takeaway_model,
+            publish_date=None, source_lang=lang, output_language=output_language,
+        )
+        requests.append((vid, system, user_text, takeaway_model, max_tokens))
+        pending.append(vid)
+
+    if not requests:
+        return
+    backend = AnthropicAPIBackend()
+    log(f"[+] Batching {len(requests)} takeaway call(s) via Message Batches "
+        f"(50% off) with {takeaway_model}...")
+    results = backend.text_batch(requests, log=lambda m: log(f"      {m}"))
+
+    for vid in pending:
+        got = results.get(vid)
+        if got is None:
+            log(f"  [warn] {vid}: absent from takeaway batch — synchronous fallback")
+            try:
+                build_takeaway_for_video(vid, digests_dir=digests_dir)
+            except Exception as e:
+                log(f"  [warn] {vid}: takeaway fallback failed ({e})")
+            continue
+        text, usage = got
+        record_llm_usage(
+            video_id=vid, kind="takeaway", model=takeaway_model,
+            backend_name=backend.name, usage=usage, batch=True,
+        )
+        body = render_takeaway_markdown(
+            text, video_url=f"https://www.youtube.com/watch?v={vid}",
+        )
+        _atomic_write_text(digests_dir / vid / "takeaway.md", body)
+        _atomic_write_json(digests_dir / vid / "takeaway.json",
+                           takeaway_text_to_json(body))
+        log(f"      takeaway -> {vid}")
 
 
 def build_slides_for_video(
