@@ -118,6 +118,8 @@ What to cache: long, stable prefixes reused across calls — system prompts, too
 
 The Batch API is a **flat 50% discount** on input *and* output, and it **stacks with caching** (combined up to ~95% off). Constraints: async (poll/retrieve), ≤24h turnaround (usually minutes), no streaming, `max_tokens ≥ 1`. Any non-interactive workload — evals, bulk summarization/moderation, offline pipelines — should default to Batch.
 
+> **This app does exactly this.** yt2md's background subscription poll (`watch run` / scheduler) routes the panel + takeaway generation through the Batch API — nobody is waiting on a background digest, so it takes the 50% cut. Interactive paths (the web "Generate" buttons, the one-off digest) stay on the direct API. The discount is per-request, so it pays off even for a single new video. See the *Batched background generation* note in `CLAUDE.md`.
+
 ### 7. Context management for long agent loops
 
 In multi-turn agent loops, input grows unbounded as history accumulates. Server-side **context editing** (`clear_tool_uses`, `clear_thinking`) and **compaction** cap it. Cost interaction: clearing **invalidates the cached prefix** at the clear point, forcing a re-write — use `clear_at_least` so the input you remove outweighs the re-write cost.
