@@ -10890,6 +10890,13 @@ def main():
     else:
         deck_path = None
 
+    # Frame extraction is needed only when building slides OR when vision
+    # picking is enabled (to supply the frame pool for vision_pick_frames).
+    # Compute vision capability now so we can decide before spawning ffmpeg.
+    _vision_backend_for_gate = select_backend(for_vision=True)
+    _vision_capable = getattr(_vision_backend_for_gate, "vision_supported", False)
+    need_frames = deck_path is not None or (not args.no_vision and _vision_capable)
+
     workdir = Path(tempfile.mkdtemp(prefix="v2d_"))
     scene_dir = workdir / "scene"
     interval_dir = workdir / "interval"
@@ -10901,32 +10908,36 @@ def main():
         # one ffmpeg decode via filter_complex split. Cuts wall time roughly
         # in half on slide-heavy talks vs. running two parallel ffmpegs that
         # both decode the same MP4 and contend for CPU + disk read bandwidth.
-        print(f"[1/5] Extracting frames "
-              f"(scene threshold={args.scene_threshold}, interval={args.interval}s, "
-              f"single-pass)...")
-        _frames_t0 = _time.monotonic()
-        scene_frames, interval_frames = extract_scene_and_interval_frames(
-            video_path, scene_dir, interval_dir,
-            scene_threshold=args.scene_threshold,
-            interval=args.interval, duration=duration,
-        )
-        timings["frames_extract"] = round(_time.monotonic() - _frames_t0, 3)
-        frames = merge_frames(scene_frames, interval_frames)
-        cap_note = (
-            f" (capped from >={SCENE_FRAME_HARD_CAP})"
-            if len(scene_frames) == SCENE_FRAME_HARD_CAP else ""
-        )
-        print(f"      {len(scene_frames)} scene{cap_note} + "
-              f"{len(interval_frames)} interval = {len(frames)} candidate frames "
-              f"({timings['frames_extract']}s)")
+        if need_frames:
+            print(f"[1/5] Extracting frames "
+                  f"(scene threshold={args.scene_threshold}, interval={args.interval}s, "
+                  f"single-pass)...")
+            _frames_t0 = _time.monotonic()
+            scene_frames, interval_frames = extract_scene_and_interval_frames(
+                video_path, scene_dir, interval_dir,
+                scene_threshold=args.scene_threshold,
+                interval=args.interval, duration=duration,
+            )
+            timings["frames_extract"] = round(_time.monotonic() - _frames_t0, 3)
+            frames = merge_frames(scene_frames, interval_frames)
+            cap_note = (
+                f" (capped from >={SCENE_FRAME_HARD_CAP})"
+                if len(scene_frames) == SCENE_FRAME_HARD_CAP else ""
+            )
+            print(f"      {len(scene_frames)} scene{cap_note} + "
+                  f"{len(interval_frames)} interval = {len(frames)} candidate frames "
+                  f"({timings['frames_extract']}s)")
 
-        print(f"[2/5] Deduping consecutive near-identical frames "
-              f"(hash distance <= {args.hash_distance})...")
-        _dedupe_t0 = _time.monotonic()
-        frames = dedupe_frames(frames, args.hash_distance)
-        timings["frames_dedupe"] = round(_time.monotonic() - _dedupe_t0, 3)
-        print(f"      {len(frames)} unique frames ({timings['frames_dedupe']}s)")
-        timings["frames"] = round(_time.monotonic() - _frames_t0, 3)
+            print(f"[2/5] Deduping consecutive near-identical frames "
+                  f"(hash distance <= {args.hash_distance})...")
+            _dedupe_t0 = _time.monotonic()
+            frames = dedupe_frames(frames, args.hash_distance)
+            timings["frames_dedupe"] = round(_time.monotonic() - _dedupe_t0, 3)
+            print(f"      {len(frames)} unique frames ({timings['frames_dedupe']}s)")
+            timings["frames"] = round(_time.monotonic() - _frames_t0, 3)
+        else:
+            frames = []
+            print("[1-2/5] Frame extraction skipped (no --slides, no vision)")
 
         print(f"[3/5] Parsing SRT: {srt_path.name}")
         segments = parse_srt(srt_path)
@@ -10978,10 +10989,7 @@ def main():
             print(f"[5/5] Building slides ({len(slides_data)} slides) -> {deck_path}")
             build_deck(slides_data, deck_path, video_title or video_path.stem)
         else:
-            print("[5/5] Slides skipped (--no-slides)")
-            # Still need slides_data for downstream code if any consumes it,
-            # though currently only build_deck does. Use the rich pool.
-            slides_data = assign_transcript_to_frames(frames, segments, duration)
+            print("[5/5] Slides skipped (no --slides)")
 
         usage = None
         if do_digest:
