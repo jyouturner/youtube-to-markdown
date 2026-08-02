@@ -10718,11 +10718,10 @@ def main():
                          "ignored for URLs — fetched automatically)")
     ap.add_argument("-o", "--output", type=Path, default=None, metavar="PATH",
                     help="Digest output path (default: <video-name>_digest.md)")
-    ap.add_argument("--no-slides", action="store_true",
-                    help="Skip the PowerPoint deck. By default a slides.pptx file is "
-                         "written alongside the digest — the visual layer (intelligently-"
-                         "selected frames + transcript snippets) is the tool's main "
-                         "differentiator and worth shipping for every digest.")
+    ap.add_argument("--slides", action="store_true",
+                    help="Build slides.pptx alongside the digest. Off by default. "
+                         "Runs frame extraction, pHash dedup, vision classification, "
+                         "and deck generation.")
     ap.add_argument("--no-slide-classification", action="store_true",
                     help="When building slides, skip the vision-LLM classifier that filters "
                          "raw frames down to actual deck slides. Falls back to pHash dedup "
@@ -10882,14 +10881,11 @@ def main():
 
     base = video_path.stem
     digest_path = args.output if args.output is not None else Path(f"{base}_digest.md")
-    # Slides default-on: write `slides.pptx` next to digest.md so the
-    # web reader (and any KB ingester) finds it at a predictable path.
-    # --no-slides opts out; --deck path overrides; --deck-only forces it
-    # on even when --no-slides was passed (the user explicitly asked
-    # for the deck).
+    # Slides off by default. --slides opts in; --deck path overrides;
+    # --deck-only forces it on even without --slides.
     if args.deck and args.deck != "__default__":
         deck_path: Optional[Path] = Path(args.deck)
-    elif args.deck_only or not args.no_slides:
+    elif args.deck_only or args.slides:
         deck_path = digest_path.parent / "slides.pptx"
     else:
         deck_path = None
