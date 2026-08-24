@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1704,7 +1705,12 @@ def fetch_youtube(
         yt_dlp_runtime_opt["js_runtimes"] = {rt: {}}
         yt_dlp_runtime_opt["remote_components"] = ["ejs:github"]
 
-    base_opts = {**cookie_opt, **yt_dlp_runtime_opt}
+    # A URL copied out of a playlist carries `&list=`; yt-dlp's default is to
+    # resolve that to the whole playlist (extractor/common.py:_yes_playlist),
+    # which makes info["id"] the PLAYLIST id and breaks the per-video cache
+    # layout below. Always take just the video. Spread into probe_opts and
+    # both ydl_opts, so every yt-dlp call in this function agrees.
+    base_opts = {**cookie_opt, **yt_dlp_runtime_opt, "noplaylist": True}
 
     # Probe first to get the video ID for stable cache layout. We use the same
     # format selector as the download below so probe doesn't reject videos whose
@@ -3813,12 +3819,244 @@ def cmd_watch_remove(args) -> int:
     return 0
 
 
+def _flat_playlist_cookie_args() -> List[str]:
+    """--cookies-from-browser args for the flat-playlist listers, if configured.
+
+    A user's own playlist is usually *private or unlisted*, and YouTube answers
+    "The playlist does not exist" to an anonymous request for one. The download
+    path already honours this setting (see fetch_youtube's cookie_opt); the
+    listers need it too or a private playlist is invisible to `watch add`,
+    `yt2md playlist`, and the /channels video list alike.
+    """
+    browser = (
+        load_settings().get("cookies_from_browser")
+        or os.environ.get("YT2MD_COOKIES_FROM_BROWSER", "")
+    ).strip()
+    return ["--cookies-from-browser", browser] if browser else []
+
+
 def _list_channel_videos(url: str, limit: int = LATEST_LIMIT) -> List[str]:
     out = subprocess.check_output(
-        ["yt-dlp", "--flat-playlist", "--playlist-end", str(limit), "--print", "%(id)s", url],
+        ["yt-dlp", "--flat-playlist", "--playlist-end", str(limit),
+         *_flat_playlist_cookie_args(), "--print", "%(id)s", url],
         text=True,
     )
     return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+# ---- playlist backfill (manual, cost-gated) -------------------------------
+#
+# A backfill is the one operation in yt2md that can spend real money in bulk
+# (median ~$0.35/video batched, ~$0.65 unbatched), so it is deliberately NOT
+# wired into any automatic path: it never touches channels.txt or state.json,
+# so the scheduler can't re-trigger one. Both surfaces (CLI `yt2md playlist`
+# and the /channels page) plan first and require an explicit confirmation
+# before a single call is made.
+
+# Hard ceiling on how many playlist entries we will even look at. A runaway
+# "Watch Later"-sized list should hit a wall, not a bill.
+PLAYLIST_MAX_ENTRIES = 200
+
+# Stage names in the usage log, split by how a backfill bills them.
+_BATCHABLE_KINDS = ("panel", "takeaway")      # halved by the Message Batch API
+_SLIDE_KINDS = ("slide_classifier", "vision_pick")  # skipped unless --slides
+# Fallback when there's no local history to learn from (fresh install).
+_FALLBACK_VIDEO_COST_USD = 0.65
+
+
+def _list_playlist_entries(
+    url: str, limit: int = PLAYLIST_MAX_ENTRIES
+) -> List[Tuple[str, str]]:
+    """[(video_id, title)] for a playlist or channel URL, in playlist order.
+
+    Same `--flat-playlist` mechanism as _list_channel_videos (which is why a
+    playlist URL already works as a subscription), but also pulls the title so
+    a dry-run can show what it's about to spend money on.
+    """
+    out = subprocess.check_output(
+        ["yt-dlp", "--flat-playlist", "--playlist-end", str(limit),
+         *_flat_playlist_cookie_args(),
+         "--print", "%(id)s\t%(title)s", url],
+        text=True,
+    )
+    entries: List[Tuple[str, str]] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        vid, _, title = line.partition("\t")
+        vid = vid.strip()
+        if vid:
+            entries.append((vid, title.strip() or vid))
+    return entries
+
+
+def estimate_video_cost_usd(*, batched: bool = True, slides: bool = False) -> float:
+    """Median per-video pipeline cost, derived from this install's real usage log.
+
+    Beats a hardcoded constant because the number that matters depends on the
+    user's own video mix (talk length, caption availability, slide density).
+    Falls back to a constant when there's no history yet.
+
+    batched=True halves the panel/takeaway stages, matching what the Message
+    Batches API actually bills. slides=False drops the vision stages, matching
+    the current default (slides are opt-in via --slides).
+    """
+    log_path = get_data_dir() / "logs" / "llm_usage.jsonl"
+    per_video: dict = {}
+    try:
+        with log_path.open() as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                vid = rec.get("video_id")
+                if not vid:
+                    continue
+                kind = rec.get("kind") or ""
+                if not slides and kind in _SLIDE_KINDS:
+                    continue
+                cost = rec.get("cost_usd") or 0.0
+                if batched and kind in _BATCHABLE_KINDS:
+                    cost *= 0.5
+                per_video[vid] = per_video.get(vid, 0.0) + cost
+    except OSError:
+        return _FALLBACK_VIDEO_COST_USD
+    costs = sorted(c for c in per_video.values() if c > 0)
+    if not costs:
+        return _FALLBACK_VIDEO_COST_USD
+    mid = len(costs) // 2
+    if len(costs) % 2:
+        return costs[mid]
+    return (costs[mid - 1] + costs[mid]) / 2
+
+
+def plan_playlist_backfill(
+    url: str,
+    *,
+    limit: int = PLAYLIST_MAX_ENTRIES,
+    digests_dir: Optional[Path] = None,
+    seen: Optional[set] = None,
+    slides: bool = False,
+) -> dict:
+    """Work out what a backfill of `url` would do, WITHOUT doing any of it.
+
+    Backs the CLI dry-run, the /channels expandable video list, and the web
+    confirm dialog — one planner so all three can never disagree about what
+    is about to run or what it costs.
+
+    Each entry gets a state:
+      digested  - digest.md already on disk; a backfill skips it
+      seen      - marked seen in state.json but never digested (what `watch
+                  add`'s no-backfill seeding leaves behind)
+      new       - neither; a backfill would digest it
+    `seen` is only meaningful for a subscribed source; pass None for ad-hoc.
+    """
+    if digests_dir is None:
+        digests_dir = get_data_dir() / "digests"
+    entries = _list_playlist_entries(url, limit=limit)
+    seen = seen or set()
+
+    rows = []
+    todo: List[str] = []
+    for vid, title in entries:
+        if (digests_dir / vid / "digest.md").exists():
+            state = "digested"
+        elif vid in seen:
+            state = "seen"
+            todo.append(vid)
+        else:
+            state = "new"
+            todo.append(vid)
+        rows.append({"video_id": vid, "title": title, "state": state})
+
+    batched = _batch_capable()
+    per_batched = estimate_video_cost_usd(batched=True, slides=slides)
+    per_direct = estimate_video_cost_usd(batched=False, slides=slides)
+    per = per_batched if batched else per_direct
+    counts = {
+        "total": len(rows),
+        "digested": sum(1 for r in rows if r["state"] == "digested"),
+        "seen": sum(1 for r in rows if r["state"] == "seen"),
+        "new": sum(1 for r in rows if r["state"] == "new"),
+        "todo": len(todo),
+    }
+    return {
+        "url": url,
+        "entries": rows,
+        "counts": counts,
+        "todo_ids": todo,
+        "batched": batched,
+        "per_video_usd": per,
+        "est_usd": per * len(todo),
+        "est_usd_unbatched": per_direct * len(todo),
+        "truncated": len(entries) >= limit,
+    }
+
+
+def run_playlist_backfill(
+    video_ids,
+    *,
+    digests_dir: Optional[Path] = None,
+    source: str = "playlist",
+    log=print,
+) -> dict:
+    """Digest each video, then generate all panels + takeaways in ONE batch.
+
+    Same shape as cmd_watch_run's per-poll batching (panels first so takeaways
+    can integrate them), which is where the 50% discount comes from — the
+    saving scales with how many videos share the batch, so a backfill is the
+    best case for it.
+
+    Deliberately does NOT write channels.txt or state.json: a backfill is a
+    one-shot, not a subscription, and must never become something a scheduler
+    poll can repeat.
+    """
+    if digests_dir is None:
+        digests_dir = get_data_dir() / "digests"
+    video_ids = list(video_ids)
+    use_batch = _batch_capable()
+
+    done: List[str] = []
+    failed: List[str] = []
+    aborted = False
+    # A backfill is a long unattended loop, so a *systematic* fault (bad argv,
+    # missing key, expired cookies) would otherwise repeat itself once per
+    # video — 27 identical stack traces, and on a fault that only bites after
+    # the download, 27 videos' worth of wasted work. Two consecutive failures
+    # with nothing yet succeeding means it is the setup, not the video.
+    ABORT_AFTER = 2
+    for i, vid in enumerate(video_ids, 1):
+        if not done and len(failed) >= ABORT_AFTER:
+            log(f"  ABORTED: first {len(failed)} videos all failed — this looks "
+                "like a setup problem, not bad videos. Fix it and re-run; "
+                "nothing already digested will be redone.")
+            aborted = True
+            break
+        log(f"  [{i}/{len(video_ids)}] {vid} ...")
+        rc, output = _digest_video(vid, digests_dir / vid, source=source,
+                                   defer_panel=use_batch)
+        if rc == 0:
+            done.append(vid)
+        elif _is_permanent_failure(output):
+            log(f"    PERMANENTLY UNAVAILABLE: {vid} — skipping")
+            shutil.rmtree(digests_dir / vid, ignore_errors=True)
+            failed.append(vid)
+        else:
+            log(f"    FAILED: {vid}")
+            failed.append(vid)
+
+    if use_batch and done:
+        log(f"--- batching panel + takeaway for {len(done)} video(s) "
+            "via Message Batches (50% off)")
+        try:
+            batch_panels_for_videos(done, digests_dir=digests_dir, log=log)
+            batch_takeaways_for_videos(done, digests_dir=digests_dir, log=log)
+        except Exception as e:
+            log(f"  [warn] batched generation failed ({type(e).__name__}: {e}); "
+                "regenerate from the reader")
+    return {"digested": done, "failed": failed, "aborted": aborted}
 
 
 def _digest_video(
@@ -3961,6 +4199,86 @@ def cmd_watch_run(args) -> int:
 
     save_state(state)
     return 1 if any_failures else 0
+
+
+
+def cmd_playlist(args) -> int:
+    """Backfill a whole playlist (or channel) as one batch. DRY RUN by default.
+
+    Without --confirm this plans and prints and spends nothing. This is the
+    only bulk-spend path in the tool, so the safe thing has to be the default.
+    """
+    url = args.url.strip()
+    if not is_url(url):
+        sys.exit(f"Not a URL: {url}")
+
+    try:
+        plan = plan_playlist_backfill(
+            url, limit=args.limit, slides=args.slides,
+        )
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"Couldn't list playlist entries (yt-dlp exited {e.returncode}): {url}")
+    except FileNotFoundError:
+        sys.exit("yt-dlp not found on PATH.")
+
+    c = plan["counts"]
+    print(f"Playlist: {url}")
+    print(f"  {c['total']} entries"
+          + (f" (capped at --limit {args.limit})" if plan["truncated"] else ""))
+    print(f"  {c['digested']} already digested (skipped)")
+    if c["seen"]:
+        print(f"  {c['seen']} marked seen by a subscription but never digested")
+    print(f"  {c['new']} new")
+    print()
+
+    if args.list:
+        for row in plan["entries"]:
+            mark = {"digested": "[x]", "seen": "[~]", "new": "[ ]"}[row["state"]]
+            print(f"  {mark} {row['video_id']}  {row['title'][:70]}")
+        print()
+
+    todo = plan["todo_ids"]
+    if not todo:
+        print("Nothing to do — every entry is already digested.")
+        return 0
+
+    est = plan["est_usd"]
+    print(f"Would digest {len(todo)} video(s).")
+    print(f"  estimated cost: ${est:.2f} "
+          f"(${plan['per_video_usd']:.3f}/video, median of this library's history)")
+    if plan["batched"]:
+        saved = plan["est_usd_unbatched"] - est
+        print(f"  panel + takeaway go through Message Batches (50% off) "
+              f"— saves ~${saved:.2f} vs one-at-a-time")
+    else:
+        print("  [!] batching unavailable on this backend "
+              "(needs the Anthropic API backend) — full price")
+    if not args.slides:
+        print("  slides off (pass --slides to include them; adds vision cost)")
+    print()
+
+    if not args.confirm:
+        print("DRY RUN — nothing was done.")
+        print("Re-run with --confirm to execute:")
+        # shlex.quote: a URL copied out of a playlist carries `&list=`, which an
+        # unquoted copy-paste would background at the `&`.
+        print(f"  yt2md playlist {shlex.quote(url)} --confirm")
+        return 0
+
+    blocked = check_budget(action=f"backfill {len(todo)} video(s)")
+    if blocked:
+        sys.exit(f"Budget gate: {blocked}")
+
+    print(f"Backfilling {len(todo)} video(s)...")
+    result = run_playlist_backfill(todo, source="playlist")
+    verb = "Aborted" if result.get("aborted") else "Done"
+    print(f"\n{verb}. {len(result['digested'])} digested, "
+          f"{len(result['failed'])} failed"
+          + (f", {len(todo) - len(result['digested']) - len(result['failed'])} "
+             "not attempted." if result.get("aborted") else "."))
+    if result["failed"]:
+        print(f"  failed: {', '.join(result['failed'])}")
+    return 1 if result["failed"] else 0
 
 
 # ---- in-process scheduler ----
@@ -4651,7 +4969,7 @@ def _library_connect():
         -- query index for list_digests filters.
         CREATE TABLE IF NOT EXISTS digest_meta (
             digest_id      TEXT PRIMARY KEY,
-            source_kind    TEXT,           -- 'subscription' | 'oneoff' | 'meta'
+            source_kind    TEXT,           -- 'subscription' | 'oneoff' | 'meta' | 'playlist'
             added_at       INTEGER,
             user_dismissed INTEGER NOT NULL DEFAULT 0,
             user_saved     INTEGER NOT NULL DEFAULT 0
@@ -5247,7 +5565,7 @@ def list_digests(
       unread    : True → only digests not yet marked read.
       q         : substring match against title (case-insensitive).
       topic     : exact-match on a topic tag (LLM or user-assigned).
-      source    : 'subscription' | 'oneoff' | 'meta' (provenance filter).
+      source    : 'subscription' | 'oneoff' | 'meta' | 'playlist' (provenance filter).
       saved     : True → only user-saved; False → only un-saved.
       dismissed : True → only user-dismissed; False → only not-dismissed.
                   Defaults None for both → don't filter on the flag.
@@ -7733,6 +8051,7 @@ def cmd_serve(args) -> int:
     @app.route("/channels", methods=["GET"])
     def channels_page():
         from flask import request
+        from html import escape as h
         channels = read_channels()
         digests = _list_digests(digests_dir)
         sched_state = _load_schedule_state()
@@ -7775,18 +8094,45 @@ def cmd_serve(args) -> int:
             '</form>'
         )
         if channels:
+            # Each source renders collapsed. Expanding fetches its video list
+            # on demand — listing a source is a yt-dlp network round-trip, so
+            # doing it for every subscription on page load would make the page
+            # slow for no reason when the user only cares about one of them.
             body += '<ul class="channel-list">'
             for ch in channels:
                 body += (
-                    '<li>'
-                    f'<span class="url">{ch}</span>'
+                    '<li style="display:block">'
+                    '<div style="display:flex;align-items:center;gap:8px">'
+                    f'<span class="url" style="flex:1">{h(ch)}</span>'
                     '<form method="post" action="/channels/remove" style="margin:0;">'
-                    f'<input type="hidden" name="url" value="{ch}">'
+                    f'<input type="hidden" name="url" value="{h(ch)}">'
                     '<button type="submit">Remove</button>'
                     '</form>'
+                    '</div>'
+                    '<details class="src-details" data-url="'
+                    f'{h(ch)}" style="margin-top:8px">'
+                    '<summary style="cursor:pointer">Videos &amp; backfill</summary>'
+                    '<div class="src-body"><p class="meta-info">Loading…</p></div>'
+                    '</details>'
                     '</li>'
                 )
             body += '</ul>'
+            body += (
+                "<script>\n"
+                "document.querySelectorAll('.src-details').forEach(function(d){\n"
+                "  d.addEventListener('toggle', function(){\n"
+                "    if(!d.open || d.dataset.loaded) return;\n"
+                "    d.dataset.loaded = '1';\n"
+                "    var box = d.querySelector('.src-body');\n"
+                "    fetch('/channels/videos?url=' + encodeURIComponent(d.dataset.url))\n"
+                "      .then(function(r){ return r.text(); })\n"
+                "      .then(function(t){ box.innerHTML = t; })\n"
+                "      .catch(function(e){ box.innerHTML = "
+                "'<p class=\"meta-info\">Failed to load: ' + e + '</p>'; });\n"
+                "  });\n"
+                "});\n"
+                "</script>"
+            )
         else:
             body += "<p class='empty-state'>No subscriptions yet. Paste a YouTube channel URL above.</p>"
         body += (
@@ -7907,6 +8253,157 @@ def cmd_serve(args) -> int:
         channels = [c for c in read_channels() if c != url]
         write_channels(channels)
         return redirect(f"/channels?msg=Removed+{url}")
+
+    @app.route("/channels/videos")
+    def channels_videos():
+        """HTML fragment: one subscribed source's videos with their state.
+
+        Lazy-loaded when the user expands a source (listing costs a yt-dlp
+        round-trip). Renders the same plan_playlist_backfill() the CLI dry-run
+        uses, so the page and `yt2md playlist` can never disagree about what
+        would run or what it costs.
+        """
+        from flask import request
+        from html import escape as h
+
+        url = request.args.get("url", "").strip()
+        if not url or url not in read_channels():
+            return '<p class="meta-info">Unknown source.</p>', 400
+
+        state = load_state()
+        seen = set(state.get("channels", {}).get(url, {}).get("seen", []))
+        try:
+            plan = plan_playlist_backfill(url, digests_dir=digests_dir, seen=seen)
+        except Exception as e:
+            return (f'<p class="meta-info">Couldn\'t list this source '
+                    f'({h(type(e).__name__)}: {h(str(e)[:200])}).</p>')
+
+        c = plan["counts"]
+        out = (
+            '<p class="meta-info">'
+            f'{c["total"]} entries — <strong>{c["digested"]}</strong> digested, '
+            f'<strong>{c["seen"]}</strong> seen but never digested, '
+            f'<strong>{c["new"]}</strong> new'
+            + (' (list capped)' if plan["truncated"] else '')
+            + '</p>'
+        )
+
+        # The one bulk-spend control in the web UI. Gated behind typing the
+        # exact count so it can't be fired by a stray click.
+        if plan["todo_ids"]:
+            n = len(plan["todo_ids"])
+            est = plan["est_usd"]
+            note = (
+                f'Panel + takeaway run through Message Batches (50% off) — '
+                f'about ${plan["est_usd_unbatched"] - est:.2f} cheaper than '
+                f'digesting these one at a time.'
+                if plan["batched"] else
+                '<strong>Batching unavailable on this backend</strong> '
+                '(needs the Anthropic API backend) — this would run at full price.'
+            )
+            out += (
+                '<form method="post" action="/channels/backfill" '
+                'class="backfill-form" style="border:1px solid var(--border,#ccc);'
+                'padding:12px;border-radius:6px;margin:12px 0">'
+                f'<input type="hidden" name="url" value="{h(url)}">'
+                f'<input type="hidden" name="expected" value="{n}">'
+                f'<p style="margin-top:0">Backfill would digest <strong>{n}</strong> '
+                f'video(s) — estimated <strong>${est:.2f}</strong> '
+                f'(${plan["per_video_usd"]:.3f}/video, median of this library\'s '
+                f'own history).</p>'
+                f'<p class="meta-info">{note}</p>'
+                f'<label>Type <strong>{n}</strong> to confirm: '
+                '<input type="text" name="confirm_count" size="6" required '
+                'autocomplete="off"></label> '
+                '<button type="submit">Run backfill</button>'
+                '</form>'
+            )
+
+        out += '<ul class="video-list" style="list-style:none;padding-left:0">'
+        badge = {
+            "digested": ('#2e7d32', 'digested'),
+            "seen": ('#b26a00', 'seen, not digested'),
+            "new": ('#555', 'new'),
+        }
+        for row in plan["entries"]:
+            color, label = badge[row["state"]]
+            title = h(row["title"][:90])
+            vid = h(row["video_id"])
+            link = (f'<a href="/digests/{vid}/">{title}</a>'
+                    if row["state"] == "digested" else title)
+            out += (
+                '<li style="padding:3px 0">'
+                f'<span style="color:{color};font-size:0.8em;'
+                f'display:inline-block;min-width:130px">{label}</span> '
+                f'{link} <code style="font-size:0.8em;opacity:0.6">{vid}</code>'
+                '</li>'
+            )
+        out += '</ul>'
+        return out
+
+    @app.route("/channels/backfill", methods=["POST"])
+    def channels_backfill():
+        """Fire a playlist backfill — the only bulk-spend path in the web UI.
+
+        Requires the user to type the exact video count, re-plans server-side
+        (the count in the form could be stale by the time it's submitted), and
+        shells out to `yt2md playlist --confirm` so the CLI and the web run
+        literally the same code path.
+        """
+        from flask import redirect, request
+        import time as _t
+
+        gate = _require_llm_or_redirect()
+        if gate is not None:
+            return gate
+
+        url = request.form.get("url", "").strip()
+        typed = request.form.get("confirm_count", "").strip()
+        if not url or url not in read_channels():
+            return redirect("/channels?msg=Unknown+source")
+
+        # Re-plan rather than trusting the form: the source may have changed
+        # between render and submit, and the typed count must match reality.
+        state = load_state()
+        seen = set(state.get("channels", {}).get(url, {}).get("seen", []))
+        try:
+            plan = plan_playlist_backfill(url, digests_dir=digests_dir, seen=seen)
+        except Exception as e:
+            return redirect(f"/channels?msg=Couldn%27t+plan+backfill:+{type(e).__name__}")
+
+        n = len(plan["todo_ids"])
+        if n == 0:
+            return redirect("/channels?msg=Nothing+to+backfill")
+        if typed != str(n):
+            return redirect(
+                f"/channels?msg=Confirmation+didn%27t+match+({n}+to+digest+now)"
+            )
+
+        blocked = check_budget(action=f"backfill {n} video(s)")
+        if blocked:
+            return redirect(f"/channels?msg=Budget+gate:+{blocked[:80]}")
+
+        yt2md_path = shutil.which("yt2md")
+        if not yt2md_path:
+            return redirect("/channels?msg=yt2md+not+on+PATH")
+
+        log_path = data_dir / "logs" / "backfill.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_fd = open(log_path, "a")
+        log_fd.write(
+            f"\n===== {_t.strftime('%Y-%m-%d %H:%M:%S')} backfill {url} "
+            f"({n} videos, est ${plan['est_usd']:.2f}) =====\n"
+        )
+        log_fd.flush()
+        subprocess.Popen(
+            [yt2md_path, "playlist", url, "--confirm"],
+            stdout=log_fd, stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env={**os.environ, **_settings_to_env(load_settings())},
+        )
+        return redirect(
+            f"/channels?msg=Backfill+started+for+{n}+video(s)+—+see+logs/backfill.log"
+        )
 
     @app.route("/schedule")
     def schedule_page():
@@ -10661,7 +11158,7 @@ def cmd_mcp(args) -> int:
             q: case-insensitive substring match against title.
             topic: exact-match on a topic tag (LLM or user-assigned).
                 Use list_topics to discover available tags.
-            source: "subscription" | "oneoff" | "meta" (provenance filter).
+            source: "subscription" | "oneoff" | "meta" | "playlist" (provenance filter).
             saved: true → only user-saved digests.
             include_dismissed: false (default) hides user-dismissed digests.
                 true → show all including dismissed.
@@ -10895,6 +11392,21 @@ def _subcommand_main(argv: List[str]) -> int:
     p = watch_sub.add_parser("run", help="Poll all channels and digest new videos")
     p.set_defaults(func=cmd_watch_run)
 
+    playlist_p = sub.add_parser(
+        "playlist",
+        help="Backfill a whole playlist/channel as one batch (dry run unless --confirm)",
+    )
+    playlist_p.add_argument("url", help="Playlist or channel URL")
+    playlist_p.add_argument("--confirm", action="store_true",
+                            help="Actually run it. Without this, only plans and prints.")
+    playlist_p.add_argument("--limit", type=int, default=PLAYLIST_MAX_ENTRIES,
+                            help=f"Max entries to consider (default: {PLAYLIST_MAX_ENTRIES})")
+    playlist_p.add_argument("--list", action="store_true",
+                            help="Print every entry with its state")
+    playlist_p.add_argument("--slides", action="store_true",
+                            help="Also build slide decks (adds vision cost)")
+    playlist_p.set_defaults(func=cmd_playlist)
+
     serve = sub.add_parser("serve", help="Start a local web reader (also runs the in-process scheduler)")
     serve.add_argument("--port", type=int, default=7682, help="Port (default: 7682)")
     serve.add_argument("--host", default="127.0.0.1",
@@ -10925,7 +11437,7 @@ def _subcommand_main(argv: List[str]) -> int:
     list_p.add_argument("-q", default="", help="Substring match on title")
     list_p.add_argument("--topic", default="", help="Exact-match on a topic tag")
     list_p.add_argument("--source", default="",
-                        choices=("", "subscription", "oneoff", "meta"),
+                        choices=("", "subscription", "oneoff", "meta", "playlist"),
                         help="Provenance filter")
     list_p.add_argument("--saved", action="store_true",
                         help="Only digests marked saved")
@@ -10956,7 +11468,7 @@ def _subcommand_main(argv: List[str]) -> int:
     digest_p.add_argument("--wait", action="store_true",
                           help="Block until the pipeline finishes (default: detached)")
     digest_p.add_argument("--source", default="oneoff",
-                          choices=("oneoff", "subscription", "meta"),
+                          choices=("oneoff", "subscription", "meta", "playlist"),
                           help="Provenance stamp (default: oneoff)")
     digest_p.add_argument("--json", action="store_true", help="Emit JSON")
     digest_p.set_defaults(func=cmd_digest)
@@ -11014,7 +11526,7 @@ def main():
     # Subcommand dispatch — short-circuit the single-video flow when the user
     # invokes yt2md watch / serve / doctor.
     if len(sys.argv) > 1 and sys.argv[1] in (
-        "watch", "serve", "doctor", "mcp",
+        "watch", "playlist", "serve", "doctor", "mcp",
         "list", "read", "search", "digest", "topics", "retrofit-topics",
         "project-instructions", "refresh-pricing",
     ):
@@ -11056,11 +11568,11 @@ def main():
     ap.add_argument("--no-tagging", action="store_true",
                     help="Skip the LLM topic-tagging step. Tags drive the agent API's "
                          "topic filter; skip when iterating on the pipeline locally.")
-    ap.add_argument("--source", choices=("oneoff", "subscription", "meta"),
+    ap.add_argument("--source", choices=("oneoff", "subscription", "meta", "playlist"),
                     default="oneoff",
                     help="Provenance tag stamped into digest_meta. Defaults to 'oneoff' "
                          "(direct CLI / one-off web route). The watch run loop passes "
-                         "'subscription'; meta-digest runs pass 'meta'.")
+                         "'subscription'; meta-digest runs pass 'meta'; `yt2md playlist` backfills pass 'playlist'.")
     ap.add_argument("--digest-model",
                     default=os.environ.get("YT2MD_DIGEST_MODEL") or "claude-sonnet-4-6",
                     help="Claude model for the digest (default: claude-sonnet-4-6). "
