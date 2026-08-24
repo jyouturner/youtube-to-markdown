@@ -5460,6 +5460,8 @@ def read_digest(
              on topic title; first hit wins).
              "panel" / "takeaway" join after Phase A — until then they
              raise NotImplementedError.
+             "transcript" / "transcript:<start>-<end>" (seconds) for the
+             verbatim cached captions.
 
     Every return includes a `video` block so the caller can ground the
     content (link back to YouTube, render the title, etc.) without
@@ -5537,6 +5539,22 @@ def read_digest(
         except FileNotFoundError:
             raise ValueError(f"No takeaway for {digest_id}")
         return {"section": section, "video": video, "content": tk}
+    if section == "transcript" or section.startswith("transcript:"):
+        rng = section.split(":", 1)[1].strip() if ":" in section else ""
+        start = end = None
+        if rng:
+            m = re.fullmatch(r"(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)", rng)
+            if not m:
+                raise ValueError(
+                    "transcript range must look like 'transcript:90-180' "
+                    f"(seconds), got {rng!r}"
+                )
+            start, end = float(m.group(1)), float(m.group(2))
+        try:
+            return read_transcript(
+                digest_id, start=start, end=end, digests_dir=digests_dir)
+        except RuntimeError as e:
+            raise ValueError(str(e))
     raise ValueError(f"unknown section: {section!r}")
 
 
@@ -5955,6 +5973,7 @@ _SEARCH_WEIGHTS = {
     "topic.body":     2,
     "topic.bullet":   2,
     "panel.turn":     1,
+    "transcript":     1,
 }
 
 
@@ -5989,10 +6008,122 @@ def _matches_all_tokens(text: str, tokens: list) -> bool:
     return all(tok in low for tok in tokens)
 
 
+# ---- Transcript access -------------------------------------------------
+#
+# The verbatim SRT is cached under digests/<id>/downloads/<id>/ for every
+# digested video, but nothing outside the pipeline could read it: read_digest
+# returns only LLM-summarised prose. For research use the exact words matter
+# (quoting, attribution, "did they actually say that"), so the transcript
+# gets the same agent-facing treatment as every other artifact.
+
+TRANSCRIPT_BLOCK_SECONDS = 90.0
+TRANSCRIPT_DEFAULT_MAX_CHARS = 20_000
+_TRANSCRIPT_HITS_PER_DIGEST = 3
+
+
+def load_transcript_segments(
+    digest_id: str,
+    *,
+    digests_dir: Optional[Path] = None,
+) -> Tuple[List["TranscriptSegment"], str]:
+    """Parse the cached SRT for a digested video -> (segments, lang).
+
+    Raises RuntimeError when the transcript isn't on disk, which means
+    downloads/ was reclaimed and the video needs re-digesting."""
+    srt_path, lang = _resolve_cached_srt_for(digest_id, digests_dir=digests_dir)
+    return parse_srt(srt_path), lang
+
+
+def _render_transcript(
+    segments: List["TranscriptSegment"],
+    *,
+    max_chars: int,
+) -> Tuple[str, bool]:
+    """Timestamped plain text, truncated at a segment boundary (never
+    mid-sentence). Returns (text, truncated)."""
+    lines: List[str] = []
+    used = 0
+    truncated = False
+    for seg in segments:
+        line = f"[{format_timestamp(seg.start)}] {seg.text}"
+        if max_chars and used + len(line) + 1 > max_chars:
+            truncated = True
+            break
+        lines.append(line)
+        used += len(line) + 1
+    return "\n".join(lines), truncated
+
+
+def _transcript_blocks(
+    segments: List["TranscriptSegment"],
+    *,
+    window: float = TRANSCRIPT_BLOCK_SECONDS,
+) -> List[Tuple[float, float, str]]:
+    """Group segments into ~`window`-second blocks -> [(start, end, text)].
+
+    Search matches against blocks rather than individual caption cues
+    because a cue is ~5 words — far too short for a whole-token AND query
+    to ever match, and useless as a snippet even when it does."""
+    blocks: List[Tuple[float, float, str]] = []
+    cur: List[str] = []
+    cur_start = 0.0
+    cur_end = 0.0
+    for seg in segments:
+        if not cur:
+            cur_start = seg.start
+        elif seg.start - cur_start >= window:
+            blocks.append((cur_start, cur_end, " ".join(cur)))
+            cur, cur_start = [], seg.start
+        cur.append(seg.text)
+        cur_end = seg.end
+    if cur:
+        blocks.append((cur_start, cur_end, " ".join(cur)))
+    return blocks
+
+
+def read_transcript(
+    digest_id: str,
+    *,
+    start: Optional[float] = None,
+    end: Optional[float] = None,
+    max_chars: int = TRANSCRIPT_DEFAULT_MAX_CHARS,
+    digests_dir: Optional[Path] = None,
+) -> dict:
+    """Agent-facing read of the verbatim transcript, optionally windowed
+    to [start, end) seconds.
+
+    A conference talk's full transcript runs well past any sane single-
+    response budget, so output is capped at `max_chars` and the return
+    reports `truncated` alongside the full `duration` — the caller then
+    windows with start/end (or pipes a search_library `transcript:<a>-<b>`
+    hit straight back in) instead of silently getting a clipped transcript.
+    """
+    d = load_digest_json(digest_id, digests_dir=digests_dir)
+    segments, lang = load_transcript_segments(digest_id, digests_dir=digests_dir)
+    duration = segments[-1].end if segments else 0.0
+    lo = 0.0 if start is None else float(start)
+    hi = float("inf") if end is None else float(end)
+    window = [s for s in segments if lo <= s.start < hi]
+    text, truncated = _render_transcript(window, max_chars=max_chars)
+    return {
+        "section": "transcript",
+        "video": d["video"],
+        "lang": lang,
+        "start": lo,
+        "end": None if hi == float("inf") else hi,
+        "duration": duration,
+        "segments": len(window),
+        "total_segments": len(segments),
+        "truncated": truncated,
+        "text": text,
+    }
+
+
 def search_library(
     q: str,
     *,
     k: int = 10,
+    include_transcript: bool = True,
     digests_dir: Optional[Path] = None,
 ) -> list:
     """Substring search across the whole library (digest / panel /
@@ -6064,6 +6195,26 @@ def search_library(
                         _SEARCH_WEIGHTS["takeaway"])
             except Exception:
                 pass
+
+        # Verbatim transcript — the only place the speaker's own words
+        # live, and the reason this search is worth running at all for
+        # citation work. Blocked into ~90s windows so a hit is quotable
+        # and its `section` pipes straight back into read_digest.
+        # Capped per digest: transcript blocks outnumber every other
+        # section ~50:1, and one talkative video would otherwise crowd
+        # the whole result set.
+        if include_transcript:
+            try:
+                segs, _lang = load_transcript_segments(
+                    did, digests_dir=digests_dir)
+            except Exception:
+                segs = []  # no cached SRT — older or space-reclaimed digest
+            before = len(hits)
+            for b_start, b_end, b_text in _transcript_blocks(segs):
+                if len(hits) - before >= _TRANSCRIPT_HITS_PER_DIGEST:
+                    break
+                add(f"transcript:{int(b_start)}-{int(b_end)}", b_text,
+                    _SEARCH_WEIGHTS["transcript"])
 
     # Sort by score desc, then most-recent digest first (caller-supplied
     # mtime not in hits, so re-derive a tiebreak from digest_id order in
@@ -10937,6 +11088,27 @@ def cmd_read(args) -> int:
     return 0
 
 
+def cmd_transcript(args) -> int:
+    """yt2md transcript <id> — print the verbatim cached captions."""
+    try:
+        result = read_transcript(
+            args.video_id, start=args.start, end=args.end,
+            max_chars=args.max_chars,
+        )
+    except (RuntimeError, FileNotFoundError) as e:
+        sys.exit(f"transcript failed: {e}")
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print(f"# {result['video'].get('title', args.video_id)}")
+    print(f"({result['segments']} of {result['total_segments']} cues, "
+          f"lang={result['lang']})\n")
+    print(result["text"])
+    if result["truncated"]:
+        print("\n[truncated — re-run with a --start window]")
+    return 0
+
+
 def cmd_search(args) -> int:
     """yt2md search <query> — substring search across the library."""
     hits = search_library(args.query, k=args.k)
@@ -11199,6 +11371,8 @@ def cmd_mcp(args) -> int:
             "panel:panelists"- just the panelist bios
             "panel:turn:N"   - the Nth panel turn
             "takeaway"       - paragraphs + inline citations
+            "transcript"     - verbatim captions, timestamped
+            "transcript:A-B" - captions between A and B seconds
             "full"           - everything (digest only; panel/takeaway
                                are separate)
 
@@ -11211,7 +11385,8 @@ def cmd_mcp(args) -> int:
     @mcp.tool()
     def search_library(q: str, k: int = 10) -> list:
         """Substring search across the local library (digest + panel +
-        takeaway). Case-insensitive whole-token AND match.
+        takeaway + verbatim transcript). Case-insensitive whole-token
+        AND match.
 
         Use this to find which digests mention a topic, then pipe a
         hit's `section` directly into read_digest for the full content.
@@ -11220,6 +11395,31 @@ def cmd_mcp(args) -> int:
             url, video} sorted by score desc (title hits weight highest).
         """
         return globals()["search_library"](q, k=min(k, 50))
+
+    @mcp.tool()
+    def read_transcript(video_id: str, start: float = 0.0,
+                        end: float = 0.0, max_chars: int = 20000) -> dict:
+        """Read the verbatim transcript of a digested video — the
+        speaker's actual words, not the LLM summary. Use this when you
+        need to quote or attribute something precisely.
+
+        start/end are seconds; leave end at 0 for "to the end". A full
+        talk exceeds a single response, so output is capped at max_chars
+        and the return reports `truncated` plus the total `duration` —
+        window with start/end rather than trusting a clipped read. A
+        search_library hit whose section looks like "transcript:90-180"
+        gives you the window directly.
+
+        Returns: {video, lang, start, end, duration, segments,
+            total_segments, truncated, text}. `text` is one
+            "[m:ss] words" line per caption cue.
+        """
+        return globals()["read_transcript"](
+            video_id,
+            start=start or None,
+            end=end or None,
+            max_chars=max_chars,
+        )
 
     # ---- Ingestion + generation ---------------------------------------
 
@@ -11452,10 +11652,25 @@ def _subcommand_main(argv: List[str]) -> int:
     read_p.add_argument("--section", default="full",
                         help='full | meta | overview | topics | topic:N | '
                              'topic:<slug> | panel | panel:turn:N | '
-                             'panel:panelists | takeaway')
+                             'panel:panelists | takeaway | transcript | '
+                             'transcript:<start>-<end>')
     read_p.add_argument("--json", action="store_true",
                         help="Emit JSON (default: pretty-printed)")
     read_p.set_defaults(func=cmd_read)
+
+    tr_p = sub.add_parser("transcript",
+                          help="Print the verbatim transcript of a digest")
+    tr_p.add_argument("video_id", help="YouTube video ID (digest dir name)")
+    tr_p.add_argument("--start", type=float, default=None,
+                      help="Window start in seconds")
+    tr_p.add_argument("--end", type=float, default=None,
+                      help="Window end in seconds")
+    tr_p.add_argument("--max-chars", type=int, dest="max_chars",
+                      default=0,
+                      help="Truncate at N chars (default: 0 = no limit; "
+                           "the MCP tool caps itself, the CLI shouldn't)")
+    tr_p.add_argument("--json", action="store_true", help="Emit JSON")
+    tr_p.set_defaults(func=cmd_transcript)
 
     search_p = sub.add_parser("search", help="Substring search across the library")
     search_p.add_argument("query", help="Search query (case-insensitive, AND across tokens)")
@@ -11528,6 +11743,7 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] in (
         "watch", "playlist", "serve", "doctor", "mcp",
         "list", "read", "search", "digest", "topics", "retrofit-topics",
+        "transcript",
         "project-instructions", "refresh-pricing",
     ):
         load_env_files()
