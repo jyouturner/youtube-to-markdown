@@ -6256,6 +6256,213 @@ def _resolve_cached_srt_for(
     return srt_path, lang
 
 
+# ---- Publishing / export -----------------------------------------------
+#
+# The library is a private working directory: 22GB of cached MP4s wrapped
+# around a few MB of generated prose. Export lifts out just the shareable
+# text — digest, panel, takeaway, transcript — into a plain directory tree
+# that renders on GitHub with no tooling. Deliberately CLI-only (not an
+# MCP tool): it writes arbitrary directories on the caller's disk, which
+# is a poor thing to hand an agent, and unlike every other capability here
+# it is a publishing decision rather than a library read.
+
+_EXPORT_IMG_RE = re.compile(
+    r'^[ \t]*<img src="digest_images/[^"]*"[^>]*>[ \t]*\n\n?',
+    re.MULTILINE)
+
+
+def _export_strip_images(md: str) -> str:
+    """Drop the per-topic <img> tags from a digest.
+
+    The frames live in digest_images/ and are stills lifted from someone
+    else's video; an export that omits them would otherwise render as a
+    page of broken-image icons. The timestamped YouTube deep links in each
+    topic heading already point a reader at the same moment."""
+    return _EXPORT_IMG_RE.sub("", md)
+
+
+def _export_slug(video_id: str, title: str) -> str:
+    """`<slugged-title>-<id>` — readable in a file listing, still unique."""
+    base = re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")
+    return f"{base[:60].strip('-')}-{video_id}" if base else video_id
+
+
+def export_library(
+    target: Path,
+    *,
+    video_ids: Optional[List[str]] = None,
+    playlist_url: Optional[str] = None,
+    transcripts: bool = True,
+    images: bool = False,
+    title: str = "Video digests",
+    intro: str = "",
+    limit: int = PLAYLIST_MAX_ENTRIES,
+    digests_dir: Optional[Path] = None,
+) -> dict:
+    """Write the shareable artifacts of selected digests into `target`.
+
+    Selection is one of: explicit `video_ids`, every digested video in
+    `playlist_url` (planned with plan_playlist_backfill, so the export
+    lands in playlist order and can never disagree with what the backfill
+    thought it digested), or — with neither — the whole library.
+
+    Layout, chosen so GitHub renders it with no configuration:
+        README.md                  index table, one row per video
+        videos/<slug>/README.md    the digest (GitHub shows it on the dir)
+        videos/<slug>/panel.md
+        videos/<slug>/takeaway.md
+        videos/<slug>/transcript.srt
+        videos/<slug>/meta.json
+
+    Returns {target, exported, skipped, bytes}. Idempotent: re-running
+    overwrites in place, so a refreshed export is a plain `git diff`.
+    """
+    if digests_dir is None:
+        digests_dir = get_data_dir() / "digests"
+    target = Path(target).expanduser()
+
+    order: List[str]
+    if video_ids:
+        order = list(video_ids)
+    elif playlist_url:
+        plan = plan_playlist_backfill(
+            playlist_url, limit=limit, digests_dir=digests_dir)
+        order = [r["video_id"] for r in plan["entries"]
+                 if r["state"] == "digested"]
+    else:
+        order = [e["id"] for e in list_digests(limit=10_000,
+                                               digests_dir=digests_dir)]
+
+    videos_dir = target / "videos"
+    videos_dir.mkdir(parents=True, exist_ok=True)
+
+    rows: List[dict] = []
+    skipped: List[str] = []
+    written = 0
+
+    for vid in order:
+        src = digests_dir / vid
+        digest_md = src / "digest.md"
+        if not digest_md.exists():
+            skipped.append(vid)
+            continue
+        meta = {}
+        try:
+            meta = json.loads((src / "metadata.json").read_text())
+        except Exception:
+            pass
+        vtitle = meta.get("title") or vid
+        slug = _export_slug(vid, vtitle)
+        out = videos_dir / slug
+        out.mkdir(parents=True, exist_ok=True)
+
+        body = digest_md.read_text(encoding="utf-8")
+        if not images:
+            body = _export_strip_images(body)
+        (out / "README.md").write_text(body, encoding="utf-8")
+        written += len(body)
+
+        for name in ("panel.md", "takeaway.md"):
+            f = src / name
+            if f.exists():
+                txt = f.read_text(encoding="utf-8")
+                (out / name).write_text(txt, encoding="utf-8")
+                written += len(txt)
+
+        has_transcript = False
+        if transcripts:
+            try:
+                srt_path, _lang = _resolve_cached_srt_for(
+                    vid, digests_dir=digests_dir)
+                txt = srt_path.read_text(encoding="utf-8-sig")
+                (out / "transcript.srt").write_text(txt, encoding="utf-8")
+                written += len(txt)
+                has_transcript = True
+            except Exception:
+                pass  # downloads/ reclaimed — export the prose anyway
+
+        if images and (src / "digest_images").is_dir():
+            dst = out / "digest_images"
+            dst.mkdir(exist_ok=True)
+            for img in (src / "digest_images").glob("*.jpg"):
+                dst.joinpath(img.name).write_bytes(img.read_bytes())
+                written += img.stat().st_size
+
+        (out / "meta.json").write_text(json.dumps({
+            "video_id": vid,
+            "title": vtitle,
+            "url": meta.get("url") or f"https://www.youtube.com/watch?v={vid}",
+            "channel": meta.get("channel_name", ""),
+            "upload_date": meta.get("upload_date", ""),
+            "topics": meta.get("topics", []),
+        }, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        rows.append({
+            "slug": slug, "video_id": vid, "title": vtitle,
+            "url": meta.get("url") or f"https://www.youtube.com/watch?v={vid}",
+            "channel": meta.get("channel_name", ""),
+            "upload_date": meta.get("upload_date", ""),
+            "has_panel": (out / "panel.md").exists(),
+            "has_takeaway": (out / "takeaway.md").exists(),
+            "has_transcript": has_transcript,
+        })
+
+    (target / "README.md").write_text(
+        _render_export_index(rows, title=title, intro=intro,
+                             transcripts=transcripts),
+        encoding="utf-8")
+
+    return {
+        "target": str(target),
+        "exported": len(rows),
+        "skipped": skipped,
+        "bytes": written,
+        "videos": rows,
+    }
+
+
+def _render_export_index(
+    rows: List[dict], *, title: str, intro: str, transcripts: bool,
+) -> str:
+    """The repo's front page: what this is, how it was made, and a table
+    linking every video to its own directory and back to YouTube."""
+    def fmt_date(d: str) -> str:
+        return f"{d[:4]}-{d[4:6]}-{d[6:8]}" if len(d) == 8 and d.isdigit() else ""
+
+    lines = [f"# {title}", ""]
+    if intro:
+        lines += [intro, ""]
+    lines += [
+        f"{len(rows)} video{'s' if len(rows) != 1 else ''}. Each directory holds "
+        "an AI-generated digest, a multi-expert panel critique, a synthesis "
+        "takeaway"
+        + (", and the verbatim transcript." if transcripts else "."),
+        "",
+        "Generated with [yt2md](https://github.com/jyouturner/youtube-to-markdown). "
+        "The digests, panels, and takeaways are model-written summaries of the "
+        "linked videos — read them as notes, not as a substitute for the source. "
+        "Every topic heading deep-links to its timestamp on YouTube.",
+        "",
+        "| Video | Channel | Published | Artifacts |",
+        "| --- | --- | --- | --- |",
+    ]
+    for r in rows:
+        arts = ["[digest](videos/%s/README.md)" % r["slug"]]
+        if r["has_panel"]:
+            arts.append("[panel](videos/%s/panel.md)" % r["slug"])
+        if r["has_takeaway"]:
+            arts.append("[takeaway](videos/%s/takeaway.md)" % r["slug"])
+        if r["has_transcript"]:
+            arts.append("[transcript](videos/%s/transcript.srt)" % r["slug"])
+        safe_title = r["title"].replace("|", "\\|")
+        lines.append(
+            f"| [{safe_title}]({r['url']}) | {r['channel']} | "
+            f"{fmt_date(r['upload_date'])} | {' · '.join(arts)} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def build_panel_for_video(
     video_id: str,
     *,
@@ -11088,6 +11295,30 @@ def cmd_read(args) -> int:
     return 0
 
 
+def cmd_export(args) -> int:
+    """yt2md export <dir> — write shareable artifacts into a plain tree."""
+    result = export_library(
+        Path(args.target),
+        video_ids=[v.strip() for v in args.ids.split(",") if v.strip()] or None,
+        playlist_url=args.playlist or None,
+        transcripts=not args.no_transcripts,
+        images=args.images,
+        title=args.title,
+        intro=args.intro,
+        limit=args.limit,
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print(f"Exported {result['exported']} video(s) "
+          f"({result['bytes'] / 1e6:.1f} MB) to {result['target']}")
+    if result["skipped"]:
+        print(f"Skipped {len(result['skipped'])} not-yet-digested: "
+              + ", ".join(result["skipped"][:8])
+              + ("…" if len(result["skipped"]) > 8 else ""))
+    return 0
+
+
 def cmd_transcript(args) -> int:
     """yt2md transcript <id> — print the verbatim cached captions."""
     try:
@@ -11658,6 +11889,26 @@ def _subcommand_main(argv: List[str]) -> int:
                         help="Emit JSON (default: pretty-printed)")
     read_p.set_defaults(func=cmd_read)
 
+    ex_p = sub.add_parser("export",
+                          help="Write shareable digest artifacts to a directory")
+    ex_p.add_argument("target", help="Destination directory (e.g. a git repo)")
+    ex_p.add_argument("--playlist", default="",
+                      help="Export the digested videos of this playlist/channel URL, in playlist order")
+    ex_p.add_argument("--ids", default="",
+                      help="Comma-separated video IDs (overrides --playlist)")
+    ex_p.add_argument("--no-transcripts", action="store_true",
+                      help="Omit transcript.srt")
+    ex_p.add_argument("--images", action="store_true",
+                      help="Include the extracted topic frames (default: stripped)")
+    ex_p.add_argument("--title", default="Video digests",
+                      help="Title for the generated index README")
+    ex_p.add_argument("--intro", default="",
+                      help="Paragraph inserted under the index title")
+    ex_p.add_argument("--limit", type=int, default=PLAYLIST_MAX_ENTRIES,
+                      help=f"Max playlist entries to consider (default: {PLAYLIST_MAX_ENTRIES})")
+    ex_p.add_argument("--json", action="store_true", help="Emit JSON")
+    ex_p.set_defaults(func=cmd_export)
+
     tr_p = sub.add_parser("transcript",
                           help="Print the verbatim transcript of a digest")
     tr_p.add_argument("video_id", help="YouTube video ID (digest dir name)")
@@ -11743,7 +11994,7 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] in (
         "watch", "playlist", "serve", "doctor", "mcp",
         "list", "read", "search", "digest", "topics", "retrofit-topics",
-        "transcript",
+        "transcript", "export",
         "project-instructions", "refresh-pricing",
     ):
         load_env_files()
