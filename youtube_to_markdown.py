@@ -29,7 +29,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 # ---------- Step 1: Frame extraction (scene detection + periodic sampling) ----------
@@ -6296,6 +6296,7 @@ def export_library(
     images: bool = False,
     title: str = "Video digests",
     intro: str = "",
+    license: str = "",
     limit: int = PLAYLIST_MAX_ENTRIES,
     digests_dir: Optional[Path] = None,
 ) -> dict:
@@ -6405,11 +6406,18 @@ def export_library(
             "has_panel": (out / "panel.md").exists(),
             "has_takeaway": (out / "takeaway.md").exists(),
             "has_transcript": has_transcript,
+            "topics": meta.get("topics", []),
         })
+
+    topic_index = _render_topic_index(rows, title=title)
+    if topic_index:
+        (target / "TOPICS.md").write_text(topic_index, encoding="utf-8")
 
     (target / "README.md").write_text(
         _render_export_index(rows, title=title, intro=intro,
-                             transcripts=transcripts),
+                             transcripts=transcripts,
+                             license=license,
+                             topics=bool(topic_index)),
         encoding="utf-8")
 
     return {
@@ -6423,6 +6431,7 @@ def export_library(
 
 def _render_export_index(
     rows: List[dict], *, title: str, intro: str, transcripts: bool,
+    license: str = "", topics: bool = False,
 ) -> str:
     """The repo's front page: what this is, how it was made, and a table
     linking every video to its own directory and back to YouTube."""
@@ -6443,6 +6452,10 @@ def _render_export_index(
         "linked videos — read them as notes, not as a substitute for the source. "
         "Every topic heading deep-links to its timestamp on YouTube.",
         "",
+    ]
+    if topics:
+        lines += ["**[Browse by topic →](TOPICS.md)**", ""]
+    lines += [
         "| Video | Channel | Published | Artifacts |",
         "| --- | --- | --- | --- |",
     ]
@@ -6459,7 +6472,64 @@ def _render_export_index(
             f"| [{safe_title}]({r['url']}) | {r['channel']} | "
             f"{fmt_date(r['upload_date'])} | {' · '.join(arts)} |"
         )
+    if license:
+        # Stated explicitly because this tree is two different things with
+        # two different owners: the generated prose is the publisher's, the
+        # transcripts are the speakers'. A bare LICENSE file at the root
+        # would read as a claim over both.
+        lines += [
+            "",
+            "## License",
+            "",
+            f"The generated digests, panel critiques, and takeaways are "
+            f"released under {license} — see [LICENSE](LICENSE).",
+            "",
+            "Transcripts and any quoted material remain the property of the "
+            "original rightsholders; they are included here for reference "
+            "and study, and are not covered by that grant.",
+        ]
     lines.append("")
+    return "\n".join(lines)
+
+
+_EXPORT_ACRONYMS = {
+    "ai", "aip", "api", "llm", "mcp", "ml", "gpu", "etl", "sql", "ui",
+    "ux", "saas", "rag", "nlp", "ocr", "iot", "hr", "it",
+}
+
+
+def _render_topic_index(rows: List[dict], *, title: str) -> str:
+    """TOPICS.md — the same videos grouped by their LLM-assigned tags.
+
+    A flat 27-row table is a list, not a map. Topics are sorted by breadth
+    so the reader sees the shape of the collection first; a video appears
+    under every topic it carries, since these are tags, not a taxonomy."""
+    by_topic: Dict[str, List[dict]] = {}
+    for r in rows:
+        for t in r.get("topics") or []:
+            by_topic.setdefault(str(t), []).append(r)
+    if not by_topic:
+        return ""
+
+    lines = [f"# {title} — by topic", "",
+             f"{len(by_topic)} topics across {len(rows)} videos. "
+             "Tags are model-assigned, so a video appears under each topic "
+             "it touches. Back to the [full index](README.md).", ""]
+    for topic, vids in sorted(by_topic.items(),
+                              key=lambda kv: (-len(kv[1]), kv[0])):
+        # .title() alone renders "ai-infrastructure" as "Ai Infrastructure";
+        # these tags are acronym-heavy, so re-case the known ones.
+        pretty = " ".join(
+            w.upper() if w in _EXPORT_ACRONYMS else w.title()
+            for w in topic.replace("_", "-").split("-") if w
+        )
+        lines += [f"## {pretty} ({len(vids)})", ""]
+        for r in vids:
+            lines.append(
+                f"- [{r['title']}](videos/{r['slug']}/README.md) "
+                f"· [watch]({r['url']})"
+            )
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -11305,6 +11375,7 @@ def cmd_export(args) -> int:
         images=args.images,
         title=args.title,
         intro=args.intro,
+        license=args.license,
         limit=args.limit,
     )
     if args.json:
@@ -11904,6 +11975,10 @@ def _subcommand_main(argv: List[str]) -> int:
                       help="Title for the generated index README")
     ex_p.add_argument("--intro", default="",
                       help="Paragraph inserted under the index title")
+    ex_p.add_argument("--license", default="",
+                      help="Name the license covering the generated content "
+                           "(e.g. 'CC BY 4.0'); adds a scoped License section "
+                           "to the index")
     ex_p.add_argument("--limit", type=int, default=PLAYLIST_MAX_ENTRIES,
                       help=f"Max playlist entries to consider (default: {PLAYLIST_MAX_ENTRIES})")
     ex_p.add_argument("--json", action="store_true", help="Emit JSON")
